@@ -3,14 +3,10 @@ services:
     name: adframe
     runtime: node
     plan: starter
-    buildCommand: |
-      cd client && npm install && npm run build && cd ../server && npm install && npx puppeteer browsers install chrome
-    startCommand: cd server && node server.js
+    buildCommand: npm install && npm run build && cd server && npx puppeteer browsers install chrome
+    startCommand: npm start
     envVars:
       - key: NODE_ENV
         value: production
       - key: GEMINI_API_KEY
         sync: false
-      - key: PUPPETEER_EXECUTABLE_PATH
-        value: /opt/render/.cache/puppeteer/chrome/linux-*/chrome-linux64/chrome
-    healthCheckPath: /api/suggest-websites

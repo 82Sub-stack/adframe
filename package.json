@@ -1,0 +1,13 @@
+{
+  "name": "adframe",
+  "version": "1.0.0",
+  "description": "AdFrame - Ad placement mockup generator for digital media agencies",
+  "scripts": {
+    "install:all": "cd client && npm install && cd ../server && npm install",
+    "build": "cd client && npm run build",
+    "start": "cd server && node server.js",
+    "dev:server": "cd server && node --watch server.js",
+    "dev:client": "cd client && npm run dev",
+    "postinstall": "cd client && npm install && cd ../server && npm install"
+  }
+}
