@@ -1,82 +1,77 @@
 /**
  * Ad compositing service using Sharp.
  * Composites ad creatives onto website screenshots at correct positions.
+ * Uses detected ad slot positions when available, with smart fallback.
  */
 
 const sharp = require('sharp');
 const { renderAdTag } = require('./puppeteer');
 
-// Placement positions by ad size (as fraction of page dimensions)
 const PLACEMENT_CONFIG = {
-  '728x90': {
-    name: 'Leaderboard',
-    desktop: { xAlign: 'center', yFraction: 0.05 }, // Top of page, below header
-    mobile: null, // Desktop-only
-  },
-  '970x250': {
-    name: 'Billboard',
-    desktop: { xAlign: 'center', yFraction: 0.04 },
-    mobile: null,
-  },
-  '300x250': {
-    name: 'Medium Rectangle',
-    desktop: { xAlign: 'right', yFraction: 0.35 },
-    mobile: { xAlign: 'center', yFraction: 0.30 },
-  },
-  '300x600': {
-    name: 'Half Page',
-    desktop: { xAlign: 'right', yFraction: 0.25 },
-    mobile: { xAlign: 'center', yFraction: 0.30 },
-  },
-  '160x600': {
-    name: 'Wide Skyscraper',
-    desktop: { xAlign: 'left-sidebar', yFraction: 0.15 },
-    mobile: null,
-  },
+  '728x90': { name: 'Leaderboard' },
+  '970x250': { name: 'Billboard' },
+  '300x250': { name: 'Medium Rectangle' },
+  '300x600': { name: 'Half Page' },
+  '160x600': { name: 'Wide Skyscraper' },
 };
 
 /**
- * Calculate the x,y position for ad placement on the screenshot.
+ * Calculate fallback placement when no ad slot is detected on the page.
+ * Uses layout-aware heuristics based on ad size and typical page structure.
  */
-function calculatePlacement(adWidth, adHeight, pageWidth, pageHeight, device, adSize) {
-  const config = PLACEMENT_CONFIG[adSize];
-  const placement = device === 'mobile' ? (config?.mobile || config?.desktop) : config?.desktop;
-
-  if (!placement) {
-    // Fallback: center of page at 30% down
-    return {
-      x: Math.max(0, Math.floor((pageWidth - adWidth) / 2)),
-      y: Math.floor(pageHeight * 0.3),
-    };
-  }
+function calculateFallbackPlacement(adWidth, adHeight, pageWidth, pageHeight, device, adSize) {
+  const viewportH = device === 'mobile' ? 844 : 900;
+  // Typical page layout: header ~80px, nav ~50px, content starts ~150px
+  const contentStart = 150;
 
   let x, y;
 
-  // Calculate Y position
-  y = Math.floor(pageHeight * placement.yFraction);
-  // Ensure ad doesn't go off-page
-  y = Math.min(y, pageHeight - adHeight - 20);
-  y = Math.max(20, y);
-
-  // Calculate X position
-  switch (placement.xAlign) {
-    case 'center':
+  switch (adSize) {
+    case '728x90':
+    case '970x250':
+      // Leaderboard/Billboard: centered, just below navigation
       x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
+      y = contentStart;
       break;
-    case 'right':
-      // Place in right sidebar area (roughly 70% from left on desktop)
-      if (device === 'desktop') {
-        x = Math.min(pageWidth - adWidth - 20, Math.floor(pageWidth * 0.70));
-      } else {
+
+    case '300x250':
+      if (device === 'mobile') {
+        // Mobile: centered, between content blocks (~1.5 screens down)
         x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
+        y = Math.min(Math.floor(viewportH * 1.5), pageHeight - adHeight - 20);
+      } else {
+        // Desktop: right sidebar area. Content is typically 60-70% width.
+        const contentAreaWidth = Math.floor(pageWidth * 0.65);
+        x = Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20);
+        y = contentStart + 100;
       }
       break;
-    case 'left-sidebar':
-      x = 20;
+
+    case '300x600':
+      if (device === 'mobile') {
+        x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
+        y = Math.min(Math.floor(viewportH * 1.2), pageHeight - adHeight - 20);
+      } else {
+        const contentAreaWidth = Math.floor(pageWidth * 0.65);
+        x = Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20);
+        y = contentStart + 50;
+      }
       break;
+
+    case '160x600':
+      // Skyscraper: left sidebar, below header
+      x = 10;
+      y = contentStart + 50;
+      break;
+
     default:
       x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
+      y = Math.min(Math.floor(viewportH * 0.5), pageHeight - adHeight - 20);
   }
+
+  // Ensure bounds
+  x = Math.max(0, Math.min(x, pageWidth - adWidth));
+  y = Math.max(10, Math.min(y, pageHeight - adHeight - 10));
 
   return { x, y };
 }
@@ -89,28 +84,23 @@ async function createAdOverlay(adImageBuffer, adWidth, adHeight) {
   const labelHeight = 16;
   const borderColor = '#FF6B35';
 
-  // Total size including border and label
   const totalWidth = adWidth + borderWidth * 2;
   const totalHeight = adHeight + borderWidth * 2 + labelHeight;
 
-  // Create the "AD" label as SVG
   const labelSvg = `<svg width="${totalWidth}" height="${labelHeight}">
     <rect width="${totalWidth}" height="${labelHeight}" fill="${borderColor}" rx="0"/>
     <text x="4" y="12" font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="white">AD</text>
   </svg>`;
 
-  // Create border frame
   const borderSvg = `<svg width="${totalWidth}" height="${totalHeight}">
     <rect x="0" y="0" width="${totalWidth}" height="${totalHeight}" fill="none" stroke="${borderColor}" stroke-width="${borderWidth * 2}" rx="1"/>
   </svg>`;
 
-  // Resize ad image to exact dimensions
   const resizedAd = await sharp(adImageBuffer)
     .resize(adWidth, adHeight, { fit: 'fill' })
     .png()
     .toBuffer();
 
-  // Composite: border frame → ad image → label
   const overlay = await sharp({
     create: {
       width: totalWidth,
@@ -131,19 +121,14 @@ async function createAdOverlay(adImageBuffer, adWidth, adHeight) {
 }
 
 /**
- * Create a placeholder ad when the actual ad tag fails to render.
+ * Create a visible placeholder ad when the actual ad tag fails to render.
  */
 async function createPlaceholder(adWidth, adHeight) {
   const svg = `<svg width="${adWidth}" height="${adHeight}" xmlns="http://www.w3.org/2000/svg">
-    <rect width="${adWidth}" height="${adHeight}" fill="#f0f0f0" stroke="#cccccc" stroke-width="1"/>
-    <rect x="0" y="0" width="${adWidth}" height="${adHeight}" fill="url(#diag)" />
-    <defs>
-      <pattern id="diag" width="20" height="20" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-        <line x1="0" y1="0" x2="0" y2="20" stroke="#e0e0e0" stroke-width="1"/>
-      </pattern>
-    </defs>
-    <text x="${adWidth / 2}" y="${adHeight / 2 - 10}" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#999999">Ad Creative</text>
-    <text x="${adWidth / 2}" y="${adHeight / 2 + 10}" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#999999">${adWidth}×${adHeight}</text>
+    <rect width="${adWidth}" height="${adHeight}" fill="#f8f0eb" stroke="#FF6B35" stroke-width="2" stroke-dasharray="8,4"/>
+    <text x="${adWidth / 2}" y="${adHeight / 2 - 12}" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#FF6B35">Ad Creative</text>
+    <text x="${adWidth / 2}" y="${adHeight / 2 + 12}" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" fill="#999">${adWidth} x ${adHeight}</text>
+    <text x="${adWidth / 2}" y="${adHeight / 2 + 32}" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#bbb">(tag failed to render)</text>
   </svg>`;
 
   return sharp(Buffer.from(svg)).png().toBuffer();
@@ -151,21 +136,23 @@ async function createPlaceholder(adWidth, adHeight) {
 
 /**
  * Generate the complete mockup: website screenshot with ad composited.
+ * Uses detected ad slot positions when available.
  */
-async function generateMockup({ screenshotBuffer, dimensions, device, adSize, adTag, adImageBuffer }) {
+async function generateMockup({ screenshotBuffer, dimensions, device, adSize, adTag, adImageBuffer, detectedSlot }) {
   const [adWidth, adHeight] = adSize.split('x').map(Number);
 
   // Get the ad creative image
   let adCreativeBuffer;
+  let adTagRendered = false;
 
   if (adImageBuffer) {
-    // User uploaded an image
     adCreativeBuffer = adImageBuffer;
   } else if (adTag) {
-    // Render the ad tag in a headless browser
     adCreativeBuffer = await renderAdTag(adTag, adWidth, adHeight);
-    if (!adCreativeBuffer) {
-      // Fallback to placeholder
+    if (adCreativeBuffer) {
+      adTagRendered = true;
+    } else {
+      console.log('Ad tag render failed, using placeholder');
       adCreativeBuffer = await createPlaceholder(adWidth, adHeight);
     }
   } else {
@@ -180,8 +167,22 @@ async function generateMockup({ screenshotBuffer, dimensions, device, adSize, ad
   const pageWidth = screenshotMeta.width;
   const pageHeight = screenshotMeta.height;
 
-  // Calculate placement position
-  const { x, y } = calculatePlacement(adWidth, adHeight, pageWidth, pageHeight, device, adSize);
+  // Determine placement: prefer detected slot, fallback to heuristic
+  let x, y;
+  let placementMethod;
+
+  if (detectedSlot) {
+    x = detectedSlot.x;
+    y = detectedSlot.y;
+    placementMethod = 'detected';
+    console.log(`Using detected ad slot at (${x}, ${y})`);
+  } else {
+    const fallback = calculateFallbackPlacement(adWidth, adHeight, pageWidth, pageHeight, device, adSize);
+    x = fallback.x;
+    y = fallback.y;
+    placementMethod = 'heuristic';
+    console.log(`No ad slot detected, using heuristic placement at (${x}, ${y})`);
+  }
 
   // Ensure overlay fits within screenshot bounds
   const safeX = Math.max(0, Math.min(x, pageWidth - totalWidth));
@@ -207,6 +208,8 @@ async function generateMockup({ screenshotBuffer, dimensions, device, adSize, ad
       y: safeY,
       adSize,
       adSizeName: PLACEMENT_CONFIG[adSize]?.name || adSize,
+      method: placementMethod,
+      adTagRendered,
     },
   };
 }

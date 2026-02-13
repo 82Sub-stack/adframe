@@ -97,12 +97,15 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       });
     }
 
+    // Parse ad dimensions for slot detection
+    const [adWidth, adHeight] = adSize.split('x').map(Number);
+
     // Generate mockup via queue
     const result = await queue.run(async () => {
-      // Step 1: Capture website screenshot
-      const captureResult = await captureWebsite(url, deviceType);
+      // Step 1: Capture website screenshot (also detects ad slot positions)
+      const captureResult = await captureWebsite(url, deviceType, adWidth, adHeight);
 
-      // Step 2: Composite ad onto screenshot
+      // Step 2: Composite ad onto screenshot using detected slot position
       const mockupResult = await generateMockup({
         screenshotBuffer: captureResult.screenshot,
         dimensions: captureResult.dimensions,
@@ -110,6 +113,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
         adSize,
         adTag: adTag || null,
         adImageBuffer: adImage ? adImage.buffer : null,
+        detectedSlot: captureResult.detectedSlot,
       });
 
       return {
