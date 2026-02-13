@@ -45,12 +45,8 @@ COPY .env.example ./.env.example
 # Build frontend
 RUN cd client && npm run build
 
-# Expose port
-EXPOSE 3001
-
-# Set environment
+# Set environment (PORT is set by Render at runtime, defaults to 10000)
 ENV NODE_ENV=production
-ENV PORT=3001
 
 # Start server
 CMD ["node", "server/server.js"]
