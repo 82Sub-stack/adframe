@@ -25,6 +25,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
   const [adTag, setAdTag] = useState('');
   const [adImage, setAdImage] = useState(null);
   const [adImagePreview, setAdImagePreview] = useState(null);
+  const [allowHeuristicFallback, setAllowHeuristicFallback] = useState(false);
   const [overrideUrl, setOverrideUrl] = useState('');
   const [suggestions, setSuggestions] = useState(null);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
@@ -110,6 +111,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
       formData.append('websiteUrl', websiteUrl);
       formData.append('adSize', adSize);
       formData.append('device', device);
+      formData.append('allowHeuristicFallback', String(allowHeuristicFallback));
 
       if (adTag) {
         formData.append('adTag', adTag);
@@ -335,6 +337,26 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
             </p>
           </div>
         )}
+      </div>
+
+      <hr className="border-gray-100" />
+
+      {/* Placement behavior */}
+      <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+        <label className="flex items-start gap-2 text-xs text-text-primary">
+          <input
+            type="checkbox"
+            checked={allowHeuristicFallback}
+            onChange={(e) => setAllowHeuristicFallback(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Allow heuristic fallback when no reliable ad slot is found
+            <span className="block text-text-muted mt-0.5">
+              Disabled means generation fails instead of placing ads in potentially wrong spots.
+            </span>
+          </span>
+        </label>
       </div>
 
       <hr className="border-gray-100" />

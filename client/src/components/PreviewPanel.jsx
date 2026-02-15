@@ -168,6 +168,9 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
       <div className="mt-4 p-3 rounded-lg bg-white border border-gray-200 text-xs text-text-muted">
         <span className="font-medium text-text-primary">Placement:</span>{' '}
         {metadata.placement.adSizeName} ({metadata.adSize}) at position ({metadata.placement.x}, {metadata.placement.y}) via {methodInfo.label}
+        {metadata.placement.domInjectionFallbackReason && (
+          <span> · DOM fallback reason: {metadata.placement.domInjectionFallbackReason}</span>
+        )}
       </div>
     </div>
   );

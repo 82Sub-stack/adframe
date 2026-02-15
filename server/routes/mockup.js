@@ -34,10 +34,22 @@ if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
 }
 
+function parseBoolean(value, defaultValue = false) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+    if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  }
+  return defaultValue;
+}
+
 router.post('/', upload.single('adImage'), async (req, res) => {
   try {
-    const { websiteUrl, adSize, device, adTag } = req.body;
+    const { websiteUrl, adSize, device, adTag, allowHeuristicFallback } = req.body;
     const adImage = req.file;
+    const allowHeuristicFallbackEnabled = parseBoolean(allowHeuristicFallback, false);
 
     // Validation
     if (!websiteUrl) {
@@ -142,7 +154,12 @@ router.post('/', upload.single('adImage'), async (req, res) => {
         adTag: adTag || null,
         adImageBuffer: adImage ? adImage.buffer : null,
         detectedSlot: captureResult.detectedSlot,
+        allowHeuristicFallback: allowHeuristicFallbackEnabled,
       });
+
+      if (captureResult.domInjection?.reason && captureResult.domInjection.reason !== 'not-attempted') {
+        mockupResult.placement.domInjectionFallbackReason = captureResult.domInjection.reason;
+      }
 
       return {
         ...mockupResult,
@@ -204,6 +221,12 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     if (err.message?.includes('timeout') || err.message?.includes('Timeout')) {
       return res.status(504).json({
         error: 'Page load timed out. Try a different website or check the URL.',
+      });
+    }
+
+    if (err.code === 'NO_RELIABLE_SLOT') {
+      return res.status(422).json({
+        error: err.message,
       });
     }
 
