@@ -93,6 +93,14 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       if (!isVisible(el, rect)) return;
       if (rect.width < 50 || rect.height < 30) return;
 
+      const text = ((el.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      const textLength = Math.min(500, text.length);
+      const headingCount = el.querySelectorAll('h1, h2, h3, h4').length;
+      const paragraphCount = el.querySelectorAll('p').length;
+      const hasArticleSignals =
+        el.matches('article, main, [role="main"]') ||
+        Boolean(el.querySelector('article, time, header h1, header h2'));
+
       results.push({
         slotId: getSlotId(el),
         x: rect.left + window.scrollX,
@@ -102,6 +110,10 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
         isAd: isAdLikely,
         type,
         viewportRatio: getViewportRatio(rect),
+        textLength,
+        headingCount,
+        paragraphCount,
+        hasArticleSignals,
       });
     };
 
@@ -171,8 +183,16 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       const hasAdHints = id.includes('ad') || cls.includes('ad') ||
         id.includes('banner') || cls.includes('banner') ||
         id.includes('gpt') || cls.includes('gpt') ||
-        id.includes('teaser') || cls.includes('teaser') ||
+        id.includes('sponsor') || cls.includes('sponsor') ||
         el.querySelector('iframe');
+
+      const text = ((el.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      const hasContentSignals =
+        text.length > 160 ||
+        Boolean(el.querySelector('h1, h2, h3, h4, article, time')) ||
+        el.matches('article, main, [role="main"]');
+
+      if (hasContentSignals && !hasAdHints) continue;
 
       pushSlot(el, rect, 'size-match', Boolean(hasAdHints));
     }
@@ -220,6 +240,15 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
     else if (s.type === 'iframe') score += 14;
     else if (s.type === 'size-match') score += 6;
 
+    if (s.textLength > 80) score -= 25;
+    if (s.textLength > 220) score -= 40;
+    if (s.headingCount > 0) score -= 30;
+    if (s.paragraphCount > 2) score -= 15;
+    if (s.hasArticleSignals) score -= 45;
+
+    if (!s.isAd && s.type === 'iframe') score -= 20;
+    if (!s.isAd && s.type === 'div') score -= 50;
+
     if (s.y >= 60 && s.y < 3200) score += 10;
     if (s.y > 6500) score -= 25;
     if (area < targetArea * 0.5) score -= 30;
@@ -230,7 +259,8 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
 
   scored.sort((a, b) => b.score - a.score);
   const candidates = scored
-    .filter((c) => c.score >= 45)
+    .filter((c) => c.score >= 55)
+    .filter((c) => c.isAd || c.type === 'iframe' || c.type === 'gpt')
     .slice(0, 8)
     .map((c) => ({
       slotId: c.slotId,
@@ -240,6 +270,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       slotHeight: Math.round(c.height),
       score: c.score,
       type: c.type,
+      isAd: c.isAd,
     }));
 
   const best = candidates[0] || null;
@@ -298,6 +329,7 @@ async function injectCreativeIntoDetectedSlot(
 
   const eligible = candidates
     .filter((c) => c?.slotId)
+    .filter((c) => c.isAd || c.type === 'iframe' || c.type === 'gpt')
     .filter((c) => (c.slotWidth || 0) >= Math.max(120, adWidth * 0.55))
     .filter((c) => (c.slotHeight || 0) >= Math.max(60, adHeight * 0.5))
     .slice(0, 5);
@@ -346,6 +378,18 @@ async function injectCreativeIntoDetectedSlot(
       const styleBefore = getComputedStyle(hostEl);
       if (styleBefore.display === 'none' || styleBefore.visibility === 'hidden' || rectBefore.width < 20 || rectBefore.height < 20) {
         return { succeeded: false, reason: 'slot-not-visible' };
+      }
+
+      const signature = `${hostEl.id || ''} ${hostEl.className || ''}`.toLowerCase();
+      const adLike = /(ad|gpt|banner|sponsor|billboard|rectangle|skyscraper|iqadtile|adtile)/.test(signature);
+      const text = ((hostEl.textContent || '') + '').replace(/\s+/g, ' ').trim();
+      const hasEditorialSignals =
+        text.length > 160 ||
+        Boolean(hostEl.querySelector('h1, h2, h3, h4, p, article, time')) ||
+        hostEl.matches('article, main, [role="main"]') ||
+        Boolean(hostEl.closest('article, main, [role="main"]'));
+      if (hasEditorialSignals && !adLike) {
+        return { succeeded: false, reason: 'content-like-slot' };
       }
 
       while (hostEl.firstChild) {
