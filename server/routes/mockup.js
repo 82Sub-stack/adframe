@@ -144,6 +144,10 @@ router.post('/', upload.single('adImage'), async (req, res) => {
         detectedSlot: captureResult.detectedSlot,
       });
 
+      if (captureResult.domInjection?.reason && captureResult.domInjection.reason !== 'not-attempted') {
+        mockupResult.placement.domInjectionFallbackReason = captureResult.domInjection.reason;
+      }
+
       return {
         ...mockupResult,
         consentHandled: captureResult.consentHandled,

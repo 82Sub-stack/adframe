@@ -81,47 +81,15 @@ function calculateFallbackPlacement(adWidth, adHeight, pageWidth, pageHeight, de
 }
 
 /**
- * Create an ad image with border and label.
+ * Prepare the creative as a clean overlay without extra frame/badge.
  */
 async function createAdOverlay(adImageBuffer, adWidth, adHeight) {
-  const borderWidth = 1;
-  const labelHeight = 16;
-  const borderColor = '#FF6B35';
-
-  const totalWidth = adWidth + borderWidth * 2;
-  const totalHeight = adHeight + borderWidth * 2 + labelHeight;
-
-  const labelSvg = `<svg width="${totalWidth}" height="${labelHeight}">
-    <rect width="${totalWidth}" height="${labelHeight}" fill="${borderColor}" rx="0"/>
-    <text x="4" y="12" font-family="Arial, sans-serif" font-size="10" font-weight="bold" fill="white">AD</text>
-  </svg>`;
-
-  const borderSvg = `<svg width="${totalWidth}" height="${totalHeight}">
-    <rect x="0" y="0" width="${totalWidth}" height="${totalHeight}" fill="none" stroke="${borderColor}" stroke-width="${borderWidth * 2}" rx="1"/>
-  </svg>`;
-
-  const resizedAd = await sharp(adImageBuffer)
+  const overlay = await sharp(adImageBuffer)
     .resize(adWidth, adHeight, { fit: 'fill' })
     .png()
     .toBuffer();
 
-  const overlay = await sharp({
-    create: {
-      width: totalWidth,
-      height: totalHeight,
-      channels: 4,
-      background: { r: 255, g: 255, b: 255, alpha: 1 },
-    },
-  })
-    .composite([
-      { input: Buffer.from(borderSvg), top: 0, left: 0 },
-      { input: resizedAd, top: borderWidth, left: borderWidth },
-      { input: Buffer.from(labelSvg), top: adHeight + borderWidth * 2, left: 0 },
-    ])
-    .png()
-    .toBuffer();
-
-  return { overlay, totalWidth, totalHeight };
+  return { overlay, totalWidth: adWidth, totalHeight: adHeight };
 }
 
 /**
@@ -129,10 +97,9 @@ async function createAdOverlay(adImageBuffer, adWidth, adHeight) {
  */
 async function createPlaceholder(adWidth, adHeight) {
   const svg = `<svg width="${adWidth}" height="${adHeight}" xmlns="http://www.w3.org/2000/svg">
-    <rect width="${adWidth}" height="${adHeight}" fill="#f8f0eb" stroke="#FF6B35" stroke-width="2" stroke-dasharray="8,4"/>
-    <text x="${adWidth / 2}" y="${adHeight / 2 - 12}" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#FF6B35">Ad Creative</text>
-    <text x="${adWidth / 2}" y="${adHeight / 2 + 12}" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" fill="#999">${adWidth} x ${adHeight}</text>
-    <text x="${adWidth / 2}" y="${adHeight / 2 + 32}" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#bbb">(tag failed to render)</text>
+    <rect width="${adWidth}" height="${adHeight}" fill="#f3f4f6" stroke="#d1d5db" stroke-width="1"/>
+    <text x="${adWidth / 2}" y="${adHeight / 2 - 6}" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#6b7280">Creative unavailable</text>
+    <text x="${adWidth / 2}" y="${adHeight / 2 + 14}" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#9ca3af">${adWidth} x ${adHeight}</text>
   </svg>`;
 
   return sharp(Buffer.from(svg)).png().toBuffer();

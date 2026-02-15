@@ -4,13 +4,14 @@
  */
 
 const puppeteer = require('puppeteer');
-const { handleConsent } = require('./consent-handler');
+const { handleConsent, setConsentCookies } = require('./consent-handler');
 
 const DESKTOP_VIEWPORT = { width: 1440, height: 900 };
 const MOBILE_VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: true };
 
 const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+const MAX_CAPTURE_HEIGHT = 10000;
 
 let browserInstance = null;
 
@@ -51,11 +52,9 @@ async function getBrowser() {
 }
 
 /**
- * Detect existing ad slots/iframes on the page and find the best one
- * matching the requested ad size. Returns {x, y} in page coordinates,
- * or null if no suitable slot is found.
+ * Detect existing ad slots/iframes and return ranked candidates.
  */
-async function detectAdSlots(page, targetWidth, targetHeight, device) {
+async function detectAdSlots(page, targetWidth, targetHeight, device, options = {}) {
   const slots = await page.evaluate((tw, th) => {
     const results = [];
     const slotIds = new WeakMap();
@@ -74,36 +73,55 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
       return newId;
     };
 
-    // 1. Find ad iframes (most common ad delivery method)
+    const isVisible = (el, rect) => {
+      if (!rect || rect.width < 1 || rect.height < 1) return false;
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      if (parseFloat(style.opacity || '1') < 0.05) return false;
+      return true;
+    };
+
+    const getViewportRatio = (rect) => {
+      const visibleW = Math.max(0, Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0));
+      const visibleH = Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0));
+      const area = rect.width * rect.height;
+      if (area <= 0) return 0;
+      return (visibleW * visibleH) / area;
+    };
+
+    const pushSlot = (el, rect, type, isAdLikely) => {
+      if (!isVisible(el, rect)) return;
+      if (rect.width < 50 || rect.height < 30) return;
+
+      results.push({
+        slotId: getSlotId(el),
+        x: rect.left + window.scrollX,
+        y: rect.top + window.scrollY,
+        width: rect.width,
+        height: rect.height,
+        isAd: isAdLikely,
+        type,
+        viewportRatio: getViewportRatio(rect),
+      });
+    };
+
+    // 1) Iframes are strong ad indicators.
     const iframes = document.querySelectorAll('iframe');
     for (const iframe of iframes) {
       const rect = iframe.getBoundingClientRect();
-      const w = rect.width || parseInt(iframe.width) || 0;
-      const h = rect.height || parseInt(iframe.height) || 0;
-      if (w < 50 || h < 50) continue; // skip tracking pixels
       const src = (iframe.src || iframe.dataset.src || '').toLowerCase();
       const id = (iframe.id || '').toLowerCase();
       const cls = (iframe.className || '').toLowerCase();
-      // Score by how well the size matches AND ad-relevance signals
       const isAdLikely = src.includes('ad') || src.includes('doubleclick') ||
         src.includes('googlesyndication') || src.includes('amazon-adsystem') ||
         src.includes('flashtalking') || src.includes('adform') ||
-        id.includes('ad') || cls.includes('ad') ||
-        id.includes('banner') || cls.includes('banner');
-      const sizeDiff = Math.abs(w - tw) + Math.abs(h - th);
-      results.push({
-        slotId: getSlotId(iframe),
-        x: rect.left + window.scrollX,
-        y: rect.top + window.scrollY,
-        width: w,
-        height: h,
-        sizeDiff,
-        isAd: isAdLikely,
-        type: 'iframe',
-      });
+        src.includes('adition') || id.includes('ad') || cls.includes('ad') ||
+        id.includes('banner') || cls.includes('banner') ||
+        id.includes('gpt') || cls.includes('gpt');
+      pushSlot(iframe, rect, 'iframe', isAdLikely);
     }
 
-    // 2. Find divs that look like ad containers
+    // 2) Common ad container selectors.
     const adSelectors = [
       '[id*="ad-"][id*="container"]', '[id*="ad_"][id*="container"]',
       '[class*="ad-"][class*="container"]', '[class*="ad_"][class*="container"]',
@@ -111,8 +129,9 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
       '[data-ad]', '[data-ad-slot]', '[data-google-query-id]',
       '[id*="billboard"]', '[id*="leaderboard"]', '[id*="skyscraper"]',
       '[id*="rectangle"]', '[class*="billboard"]', '[class*="leaderboard"]',
+      '[id*="google_ads_iframe"]', '[id*="gpt"]', '[class*="gpt"]',
       '.ad-wrapper', '.ad-container', '.ad-unit', '.ad-placement',
-      '[id*="iqadtile"]', '[class*="iqadtile"]', // IQ Digital (heise, etc.)
+      '[id*="iqadtile"]', '[class*="iqadtile"]',
       '[id*="adtile"]', '[class*="adtile"]',
     ];
     for (const sel of adSelectors) {
@@ -120,77 +139,122 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
         const els = document.querySelectorAll(sel);
         for (const el of els) {
           const rect = el.getBoundingClientRect();
-          if (rect.width < 50 || rect.height < 30) continue;
-          const sizeDiff = Math.abs(rect.width - tw) + Math.abs(rect.height - th);
-          results.push({
-            slotId: getSlotId(el),
-            x: rect.left + window.scrollX,
-            y: rect.top + window.scrollY,
-            width: rect.width,
-            height: rect.height,
-            sizeDiff,
-            isAd: true,
-            type: 'div',
-          });
+          pushSlot(el, rect, 'div', true);
         }
-      } catch (e) { /* invalid selector */ }
+      } catch (e) {
+        // Ignore invalid selectors.
+      }
     }
 
-    // 3. Find Google Ads containers specifically
     const gptSlots = document.querySelectorAll('[id^="div-gpt-ad"]');
     for (const el of gptSlots) {
       const rect = el.getBoundingClientRect();
-      if (rect.width < 50 || rect.height < 10) continue;
-      results.push({
-        slotId: getSlotId(el),
-        x: rect.left + window.scrollX,
-        y: rect.top + window.scrollY,
-        width: rect.width,
-        height: rect.height,
-        sizeDiff: Math.abs(rect.width - tw) + Math.abs(rect.height - th),
-        isAd: true,
-        type: 'gpt',
-      });
+      pushSlot(el, rect, 'gpt', true);
+    }
+
+    // 3) Generic size-match fallback for sites with sparse naming.
+    const candidates = document.querySelectorAll('div, section, aside');
+    let scanned = 0;
+    for (const el of candidates) {
+      if (scanned > 1800) break;
+      scanned++;
+
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 50 || rect.height < 30) continue;
+
+      const widthClose = Math.abs(rect.width - tw) <= Math.max(80, tw * 0.35);
+      const heightClose = Math.abs(rect.height - th) <= Math.max(80, th * 0.35);
+      if (!widthClose || !heightClose) continue;
+
+      const id = (el.id || '').toLowerCase();
+      const cls = (el.className || '').toLowerCase();
+      const hasAdHints = id.includes('ad') || cls.includes('ad') ||
+        id.includes('banner') || cls.includes('banner') ||
+        id.includes('gpt') || cls.includes('gpt') ||
+        id.includes('teaser') || cls.includes('teaser') ||
+        el.querySelector('iframe');
+
+      pushSlot(el, rect, 'size-match', Boolean(hasAdHints));
     }
 
     return results;
   }, targetWidth, targetHeight);
 
-  if (slots.length === 0) return null;
+  if (slots.length === 0) {
+    return options.returnCandidates ? { bestSlot: null, candidates: [] } : null;
+  }
 
-  // Score and sort: prefer (1) close size match, (2) ad-flagged elements, (3) visible position
-  const scored = slots.map(s => {
+  const targetArea = targetWidth * targetHeight;
+  const targetRatio = targetWidth / targetHeight;
+
+  // De-duplicate by slotId.
+  const deduped = new Map();
+  for (const slot of slots) {
+    const existing = deduped.get(slot.slotId);
+    if (!existing) {
+      deduped.set(slot.slotId, slot);
+      continue;
+    }
+    if (slot.isAd && !existing.isAd) {
+      deduped.set(slot.slotId, slot);
+    }
+  }
+
+  const scored = [...deduped.values()].map((s) => {
+    const widthMatch = Math.max(0, 1 - Math.abs(s.width - targetWidth) / targetWidth);
+    const heightMatch = Math.max(0, 1 - Math.abs(s.height - targetHeight) / targetHeight);
+    const ratio = s.width / Math.max(1, s.height);
+    const ratioMatch = Math.max(0, 1 - Math.abs(ratio - targetRatio));
+    const area = s.width * s.height;
+    const areaMatch = Math.max(0, 1 - Math.abs(area - targetArea) / targetArea);
+
     let score = 0;
-    // Size match (lower diff = better) — most important
-    if (s.sizeDiff < 20) score += 100;
-    else if (s.sizeDiff < 80) score += 60;
-    else if (s.sizeDiff < 200) score += 30;
-    else score += Math.max(0, 10 - s.sizeDiff / 50);
-    // Ad relevance
-    if (s.isAd) score += 50;
-    // Position: prefer slots in the visible area (above ~2000px)
-    if (s.y < 2000) score += 20;
-    if (s.y < 1000) score += 10;
-    // Prefer GPT/iframe over generic divs
-    if (s.type === 'gpt') score += 15;
-    if (s.type === 'iframe') score += 10;
-    return { ...s, score };
+    score += widthMatch * 35;
+    score += heightMatch * 35;
+    score += ratioMatch * 20;
+    score += areaMatch * 10;
+    score += s.viewportRatio * 15;
+
+    if (s.isAd) score += 28;
+    if (s.type === 'gpt') score += 18;
+    else if (s.type === 'iframe') score += 14;
+    else if (s.type === 'size-match') score += 6;
+
+    if (s.y >= 60 && s.y < 3200) score += 10;
+    if (s.y > 6500) score -= 25;
+    if (area < targetArea * 0.5) score -= 30;
+    if (area > targetArea * 4) score -= 18;
+
+    return { ...s, score: Math.round(score) };
   });
 
   scored.sort((a, b) => b.score - a.score);
+  const candidates = scored
+    .filter((c) => c.score >= 45)
+    .slice(0, 8)
+    .map((c) => ({
+      slotId: c.slotId,
+      x: Math.round(c.x),
+      y: Math.round(c.y),
+      slotWidth: Math.round(c.width),
+      slotHeight: Math.round(c.height),
+      score: c.score,
+      type: c.type,
+    }));
 
-  const best = scored[0];
-  if (best.score < 20) return null; // No good match
+  const best = candidates[0] || null;
 
-  console.log(`Detected ad slot: ${best.type} at (${Math.round(best.x)}, ${Math.round(best.y)}) size ${Math.round(best.width)}x${Math.round(best.height)}, score=${best.score}`);
+  if (best) {
+    console.log(
+      `Detected ad slot: ${best.type} at (${best.x}, ${best.y}) size ${best.slotWidth}x${best.slotHeight}, score=${best.score}`
+    );
+  }
 
-  return {
-    slotId: best.slotId,
-    x: Math.round(best.x),
-    y: Math.round(best.y),
-    slotWidth: Math.round(best.width),
-    slotHeight: Math.round(best.height),
-  };
+  if (options.returnCandidates) {
+    return { bestSlot: best, candidates };
+  }
+
+  return best;
 }
 
 function buildDataUri(imageBuffer, mimeType = 'image/png') {
@@ -217,19 +281,32 @@ function buildAdTagSrcDoc(adTag, width, height) {
 async function injectCreativeIntoDetectedSlot(
   page,
   detectedSlot,
-  { adTag = null, adImageBuffer = null, adWidth = 300, adHeight = 250 } = {}
+  { adTag = null, adImageBuffer = null, adWidth = 300, adHeight = 250, slotCandidates = null } = {}
 ) {
-  if (!detectedSlot?.slotId) {
-    return { succeeded: false, reason: 'no-slot' };
-  }
-
   const mode = adImageBuffer ? 'image' : adTag ? 'adtag' : null;
   if (!mode) {
     return { succeeded: false, reason: 'no-creative' };
   }
 
-  const payload = {
-    slotId: detectedSlot.slotId,
+  const candidates = Array.isArray(slotCandidates) && slotCandidates.length > 0
+    ? slotCandidates
+    : detectedSlot ? [detectedSlot] : [];
+
+  if (candidates.length === 0) {
+    return { succeeded: false, reason: 'no-slot' };
+  }
+
+  const eligible = candidates
+    .filter((c) => c?.slotId)
+    .filter((c) => (c.slotWidth || 0) >= Math.max(120, adWidth * 0.55))
+    .filter((c) => (c.slotHeight || 0) >= Math.max(60, adHeight * 0.5))
+    .slice(0, 5);
+
+  if (eligible.length === 0) {
+    return { succeeded: false, reason: 'no-eligible-slot' };
+  }
+
+  const sharedPayload = {
     mode,
     adWidth,
     adHeight,
@@ -237,128 +314,129 @@ async function injectCreativeIntoDetectedSlot(
     srcdoc: adTag ? buildAdTagSrcDoc(adTag, adWidth, adHeight) : null,
   };
 
-  const result = await page.evaluate((p) => {
-    const slotEl = document.querySelector(`[data-adframe-slot-id="${p.slotId}"]`);
-    if (!slotEl) {
-      return { succeeded: false, reason: 'slot-not-found' };
-    }
-
-    let hostEl = slotEl;
-    if (slotEl.tagName === 'IFRAME') {
-      const rect = slotEl.getBoundingClientRect();
-      const replacement = document.createElement('div');
-      replacement.setAttribute('data-adframe-slot-id', p.slotId);
-      replacement.style.width = `${Math.max(1, Math.round(rect.width || p.adWidth))}px`;
-      replacement.style.height = `${Math.max(1, Math.round(rect.height || p.adHeight))}px`;
-      replacement.style.display = 'block';
-      replacement.style.overflow = 'hidden';
-      slotEl.replaceWith(replacement);
-      hostEl = replacement;
-    }
-
-    while (hostEl.firstChild) {
-      hostEl.removeChild(hostEl.firstChild);
-    }
-
-    const computed = getComputedStyle(hostEl);
-    if (computed.position === 'static') {
-      hostEl.style.position = 'relative';
-    }
-    hostEl.style.overflow = 'hidden';
-    if (hostEl.getBoundingClientRect().height < 20) {
-      hostEl.style.minHeight = `${p.adHeight}px`;
-    }
-    if (hostEl.getBoundingClientRect().width < 20) {
-      hostEl.style.minWidth = `${p.adWidth}px`;
-    }
-
-    const creative = document.createElement('div');
-    creative.style.width = '100%';
-    creative.style.height = '100%';
-    creative.style.minWidth = `${p.adWidth}px`;
-    creative.style.minHeight = `${p.adHeight}px`;
-    creative.style.background = '#fff';
-
-    if (p.mode === 'image') {
-      const img = document.createElement('img');
-      img.src = p.imageDataUrl;
-      img.alt = 'Ad creative';
-      img.style.width = '100%';
-      img.style.height = '100%';
-      img.style.display = 'block';
-      img.style.objectFit = 'fill';
-      creative.appendChild(img);
-    } else {
-      const iframe = document.createElement('iframe');
-      iframe.srcdoc = p.srcdoc;
-      iframe.setAttribute('scrolling', 'no');
-      iframe.setAttribute('frameborder', '0');
-      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox');
-      iframe.setAttribute('data-adframe-injected', 'true');
-      iframe.style.width = '100%';
-      iframe.style.height = '100%';
-      iframe.style.border = '0';
-      iframe.style.display = 'block';
-      creative.appendChild(iframe);
-    }
-
-    hostEl.appendChild(creative);
-
-    const badge = document.createElement('div');
-    badge.textContent = 'AD';
-    badge.style.position = 'absolute';
-    badge.style.top = '0';
-    badge.style.left = '0';
-    badge.style.padding = '2px 6px';
-    badge.style.background = '#FF6B35';
-    badge.style.color = '#fff';
-    badge.style.fontFamily = 'Arial, sans-serif';
-    badge.style.fontSize = '10px';
-    badge.style.fontWeight = '700';
-    badge.style.lineHeight = '1.2';
-    badge.style.zIndex = '2147483647';
-    badge.style.pointerEvents = 'none';
-    hostEl.appendChild(badge);
-
-    const rect = hostEl.getBoundingClientRect();
-    return {
-      succeeded: true,
-      mode: p.mode,
-      x: Math.round(rect.left + window.scrollX),
-      y: Math.round(rect.top + window.scrollY),
-      slotWidth: Math.round(rect.width),
-      slotHeight: Math.round(rect.height),
+  for (let index = 0; index < eligible.length; index++) {
+    const candidate = eligible[index];
+    const payload = {
+      ...sharedPayload,
+      slotId: candidate.slotId,
+      fallbackWidth: candidate.slotWidth || adWidth,
+      fallbackHeight: candidate.slotHeight || adHeight,
     };
-  }, payload);
 
-  if (!result?.succeeded) {
-    return result || { succeeded: false, reason: 'inject-failed' };
+    const result = await page.evaluate((p) => {
+      const slotEl = document.querySelector(`[data-adframe-slot-id="${p.slotId}"]`);
+      if (!slotEl) {
+        return { succeeded: false, reason: 'slot-not-found' };
+      }
+
+      let hostEl = slotEl;
+      if (slotEl.tagName === 'IFRAME') {
+        const rect = slotEl.getBoundingClientRect();
+        const replacement = document.createElement('div');
+        replacement.setAttribute('data-adframe-slot-id', p.slotId);
+        replacement.style.width = `${Math.max(1, Math.round(rect.width || p.fallbackWidth))}px`;
+        replacement.style.height = `${Math.max(1, Math.round(rect.height || p.fallbackHeight))}px`;
+        replacement.style.display = 'block';
+        replacement.style.overflow = 'hidden';
+        slotEl.replaceWith(replacement);
+        hostEl = replacement;
+      }
+
+      const rectBefore = hostEl.getBoundingClientRect();
+      const styleBefore = getComputedStyle(hostEl);
+      if (styleBefore.display === 'none' || styleBefore.visibility === 'hidden' || rectBefore.width < 20 || rectBefore.height < 20) {
+        return { succeeded: false, reason: 'slot-not-visible' };
+      }
+
+      while (hostEl.firstChild) {
+        hostEl.removeChild(hostEl.firstChild);
+      }
+
+      if (styleBefore.position === 'static') {
+        hostEl.style.position = 'relative';
+      }
+      hostEl.style.overflow = 'hidden';
+
+      const creative = document.createElement('div');
+      creative.style.width = '100%';
+      creative.style.height = '100%';
+      creative.style.background = 'transparent';
+      creative.setAttribute('data-adframe-injected', 'true');
+
+      if (p.mode === 'image') {
+        const img = document.createElement('img');
+        img.src = p.imageDataUrl;
+        img.alt = 'Ad creative';
+        img.style.width = '100%';
+        img.style.height = '100%';
+        img.style.display = 'block';
+        img.style.objectFit = 'fill';
+        creative.appendChild(img);
+      } else {
+        const iframe = document.createElement('iframe');
+        iframe.srcdoc = p.srcdoc;
+        iframe.setAttribute('scrolling', 'no');
+        iframe.setAttribute('frameborder', '0');
+        iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox');
+        iframe.setAttribute('data-adframe-injected', 'true');
+        iframe.style.width = '100%';
+        iframe.style.height = '100%';
+        iframe.style.border = '0';
+        iframe.style.display = 'block';
+        creative.appendChild(iframe);
+      }
+
+      hostEl.appendChild(creative);
+
+      const rectAfter = hostEl.getBoundingClientRect();
+      return {
+        succeeded: true,
+        mode: p.mode,
+        x: Math.round(rectAfter.left + window.scrollX),
+        y: Math.round(rectAfter.top + window.scrollY),
+        slotWidth: Math.round(rectAfter.width),
+        slotHeight: Math.round(rectAfter.height),
+      };
+    }, payload);
+
+    if (!result?.succeeded) {
+      continue;
+    }
+
+    if (mode === 'adtag') {
+      await page.evaluate((slotId) => {
+        return new Promise((resolve) => {
+          const host = document.querySelector(`[data-adframe-slot-id="${slotId}"]`);
+          const iframe = host?.querySelector('iframe[data-adframe-injected="true"]');
+          if (!iframe) {
+            resolve(false);
+            return;
+          }
+          let settled = false;
+          const done = () => {
+            if (settled) return;
+            settled = true;
+            resolve(true);
+          };
+          iframe.addEventListener('load', done, { once: true });
+          setTimeout(done, 3000);
+        });
+      }, candidate.slotId);
+    }
+
+    await new Promise((r) => setTimeout(r, mode === 'adtag' ? 1200 : 350));
+
+    return {
+      ...result,
+      succeeded: true,
+      selectedSlotId: candidate.slotId,
+      selectedSlotScore: candidate.score,
+      selectedSlotType: candidate.type,
+      attempts: index + 1,
+    };
   }
 
-  if (mode === 'adtag') {
-    await page.evaluate((slotId) => {
-      return new Promise((resolve) => {
-        const host = document.querySelector(`[data-adframe-slot-id="${slotId}"]`);
-        const iframe = host?.querySelector('iframe[data-adframe-injected="true"]');
-        if (!iframe) {
-          resolve(false);
-          return;
-        }
-        let settled = false;
-        const done = () => {
-          if (settled) return;
-          settled = true;
-          resolve(true);
-        };
-        iframe.addEventListener('load', done, { once: true });
-        setTimeout(done, 3000);
-      });
-    }, detectedSlot.slotId);
-  }
-
-  await new Promise(r => setTimeout(r, mode === 'adtag' ? 1000 : 250));
-
-  return result;
+  return { succeeded: false, reason: 'all-candidates-failed' };
 }
 
 /**
@@ -396,10 +474,24 @@ async function captureWebsite(
 
     onProgress('Loading page...');
 
-    await page.goto(url, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
-    });
+    // Set consent cookies before first navigation to reduce CMP blocking.
+    await setConsentCookies(page, url);
+
+    try {
+      await page.goto(url, {
+        waitUntil: 'networkidle2',
+        timeout: 25000,
+      });
+    } catch (err) {
+      const isTimeout = err.name === 'TimeoutError' || err.message?.includes('timeout');
+      if (!isTimeout) throw err;
+      console.warn(`Primary navigation timed out for ${url}, retrying with domcontentloaded`);
+      await page.goto(url, {
+        waitUntil: 'domcontentloaded',
+        timeout: 20000,
+      });
+      await new Promise(r => setTimeout(r, 1500));
+    }
 
     onProgress('Handling consent banners...');
 
@@ -413,8 +505,34 @@ async function captureWebsite(
 
     onProgress('Detecting ad positions...');
 
-    // Detect ad slots BEFORE taking the screenshot
-    const detectedSlot = await detectAdSlots(page, adWidth, adHeight, device);
+    let slotDetection = await detectAdSlots(page, adWidth, adHeight, device, { returnCandidates: true });
+
+    // Second pass deeper in-page when top-of-page pass finds no suitable slot.
+    if (!slotDetection.bestSlot) {
+      await page.evaluate(() => window.scrollTo(0, window.innerHeight * 1.2));
+      await new Promise(r => setTimeout(r, 500));
+      const secondPass = await detectAdSlots(page, adWidth, adHeight, device, { returnCandidates: true });
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await new Promise(r => setTimeout(r, 300));
+
+      if (secondPass.bestSlot) {
+        const merged = [...(slotDetection.candidates || []), ...(secondPass.candidates || [])];
+        const deduped = new Map();
+        for (const candidate of merged) {
+          const current = deduped.get(candidate.slotId);
+          if (!current || (candidate.score || 0) > (current.score || 0)) {
+            deduped.set(candidate.slotId, candidate);
+          }
+        }
+        slotDetection = {
+          bestSlot: secondPass.bestSlot,
+          candidates: [...deduped.values()].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8),
+        };
+      }
+    }
+
+    const detectedSlot = slotDetection.bestSlot;
+    const slotCandidates = slotDetection.candidates || [];
 
     let domInjection = { succeeded: false, reason: 'not-attempted' };
     if (injectionOptions) {
@@ -423,21 +541,41 @@ async function captureWebsite(
         ...injectionOptions,
         adWidth,
         adHeight,
+        slotCandidates,
       });
     }
 
     onProgress('Taking screenshot...');
 
-    const screenshot = await page.screenshot({
-      type: 'png',
-      fullPage: true,
-    });
-
-    const dimensions = await page.evaluate(() => ({
+    const rawDimensions = await page.evaluate(() => ({
       width: document.documentElement.scrollWidth,
       height: document.documentElement.scrollHeight,
       viewportHeight: window.innerHeight,
     }));
+
+    const shouldTruncate = rawDimensions.height > MAX_CAPTURE_HEIGHT;
+    const screenshotOptions = shouldTruncate
+      ? {
+          type: 'png',
+          clip: {
+            x: 0,
+            y: 0,
+            width: Math.max(1, Math.min(rawDimensions.width, viewport.width)),
+            height: MAX_CAPTURE_HEIGHT,
+          },
+        }
+      : {
+          type: 'png',
+          fullPage: true,
+        };
+    const screenshot = await page.screenshot(screenshotOptions);
+
+    const dimensions = {
+      ...rawDimensions,
+      fullHeight: rawDimensions.height,
+      height: shouldTruncate ? MAX_CAPTURE_HEIGHT : rawDimensions.height,
+      truncated: shouldTruncate,
+    };
 
     return {
       screenshot: Buffer.from(screenshot),
@@ -445,6 +583,7 @@ async function captureWebsite(
       consentHandled,
       device,
       detectedSlot,
+      slotCandidates,
       domInjection,
     };
   } finally {
