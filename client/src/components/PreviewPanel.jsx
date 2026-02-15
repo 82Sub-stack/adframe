@@ -2,6 +2,31 @@ import { Download, FileCode, ExternalLink, AlertTriangle, ImageIcon, RefreshCw }
 import ProgressLoader from './ProgressLoader';
 import DeviceFrame from './DeviceFrame';
 
+function getPlacementMethodInfo(method) {
+  switch (method) {
+    case 'dom-injected':
+      return {
+        label: 'DOM Injected',
+        className: 'bg-emerald-100 text-emerald-700',
+      };
+    case 'detected':
+      return {
+        label: 'Overlay (Detected Slot)',
+        className: 'bg-amber-100 text-amber-700',
+      };
+    case 'heuristic':
+      return {
+        label: 'Overlay (Heuristic)',
+        className: 'bg-amber-100 text-amber-700',
+      };
+    default:
+      return {
+        label: 'Placement Applied',
+        className: 'bg-gray-200 text-text-primary',
+      };
+  }
+}
+
 export default function PreviewPanel({ result, isGenerating, progressStep, error }) {
   if (isGenerating) {
     return <ProgressLoader progressStep={progressStep} />;
@@ -40,6 +65,7 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
   const { mockupImageUrl, adTagDownloadUrl, metadata } = result;
   const isMobile = metadata.device === 'mobile';
   const previewUrl = `${mockupImageUrl}/preview`;
+  const methodInfo = getPlacementMethodInfo(metadata.placement?.method);
 
   return (
     <div className="p-6">
@@ -62,6 +88,9 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
                 Consent handled
               </span>
             )}
+            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${methodInfo.className}`}>
+              {methodInfo.label}
+            </span>
           </div>
           <div className="flex items-center gap-1.5 mt-2 text-xs text-text-muted">
             <ExternalLink size={11} />
@@ -138,7 +167,7 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
       {/* Placement info */}
       <div className="mt-4 p-3 rounded-lg bg-white border border-gray-200 text-xs text-text-muted">
         <span className="font-medium text-text-primary">Placement:</span>{' '}
-        {metadata.placement.adSizeName} ({metadata.adSize}) at position ({metadata.placement.x}, {metadata.placement.y})
+        {metadata.placement.adSizeName} ({metadata.adSize}) at position ({metadata.placement.x}, {metadata.placement.y}) via {methodInfo.label}
       </div>
     </div>
   );

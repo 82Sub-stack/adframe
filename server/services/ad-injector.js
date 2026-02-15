@@ -15,6 +15,10 @@ const PLACEMENT_CONFIG = {
   '160x600': { name: 'Wide Skyscraper' },
 };
 
+function getAdSizeName(adSize) {
+  return PLACEMENT_CONFIG[adSize]?.name || adSize;
+}
+
 /**
  * Calculate fallback placement when no ad slot is detected on the page.
  * Uses layout-aware heuristics based on ad size and typical page structure.
@@ -207,7 +211,7 @@ async function generateMockup({ screenshotBuffer, dimensions, device, adSize, ad
       x: safeX,
       y: safeY,
       adSize,
-      adSizeName: PLACEMENT_CONFIG[adSize]?.name || adSize,
+      adSizeName: getAdSizeName(adSize),
       method: placementMethod,
       adTagRendered,
     },
@@ -217,4 +221,5 @@ async function generateMockup({ screenshotBuffer, dimensions, device, adSize, ad
 module.exports = {
   generateMockup,
   createPlaceholder,
+  getAdSizeName,
 };
