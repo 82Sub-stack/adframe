@@ -109,7 +109,16 @@ async function createPlaceholder(adWidth, adHeight) {
  * Generate the complete mockup: website screenshot with ad composited.
  * Uses detected ad slot positions when available.
  */
-async function generateMockup({ screenshotBuffer, dimensions, device, adSize, adTag, adImageBuffer, detectedSlot }) {
+async function generateMockup({
+  screenshotBuffer,
+  dimensions,
+  device,
+  adSize,
+  adTag,
+  adImageBuffer,
+  detectedSlot,
+  allowHeuristicFallback = true,
+}) {
   const [adWidth, adHeight] = adSize.split('x').map(Number);
 
   // Get the ad creative image
@@ -148,6 +157,13 @@ async function generateMockup({ screenshotBuffer, dimensions, device, adSize, ad
     placementMethod = 'detected';
     console.log(`Using detected ad slot at (${x}, ${y})`);
   } else {
+    if (!allowHeuristicFallback) {
+      const err = new Error(
+        'No reliable ad slot was found on this page. Enable heuristic fallback to force a best-guess placement.'
+      );
+      err.code = 'NO_RELIABLE_SLOT';
+      throw err;
+    }
     const fallback = calculateFallbackPlacement(adWidth, adHeight, pageWidth, pageHeight, device, adSize);
     x = fallback.x;
     y = fallback.y;
