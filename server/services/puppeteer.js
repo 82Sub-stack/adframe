@@ -58,6 +58,21 @@ async function getBrowser() {
 async function detectAdSlots(page, targetWidth, targetHeight, device) {
   const slots = await page.evaluate((tw, th) => {
     const results = [];
+    const slotIds = new WeakMap();
+    let slotCounter = 0;
+
+    const getSlotId = (el) => {
+      if (slotIds.has(el)) return slotIds.get(el);
+      const existing = el.getAttribute('data-adframe-slot-id');
+      if (existing) {
+        slotIds.set(el, existing);
+        return existing;
+      }
+      const newId = `adf-slot-${++slotCounter}`;
+      el.setAttribute('data-adframe-slot-id', newId);
+      slotIds.set(el, newId);
+      return newId;
+    };
 
     // 1. Find ad iframes (most common ad delivery method)
     const iframes = document.querySelectorAll('iframe');
@@ -77,6 +92,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
         id.includes('banner') || cls.includes('banner');
       const sizeDiff = Math.abs(w - tw) + Math.abs(h - th);
       results.push({
+        slotId: getSlotId(iframe),
         x: rect.left + window.scrollX,
         y: rect.top + window.scrollY,
         width: w,
@@ -107,6 +123,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
           if (rect.width < 50 || rect.height < 30) continue;
           const sizeDiff = Math.abs(rect.width - tw) + Math.abs(rect.height - th);
           results.push({
+            slotId: getSlotId(el),
             x: rect.left + window.scrollX,
             y: rect.top + window.scrollY,
             width: rect.width,
@@ -125,6 +142,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
       const rect = el.getBoundingClientRect();
       if (rect.width < 50 || rect.height < 10) continue;
       results.push({
+        slotId: getSlotId(el),
         x: rect.left + window.scrollX,
         y: rect.top + window.scrollY,
         width: rect.width,
@@ -167,6 +185,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
   console.log(`Detected ad slot: ${best.type} at (${Math.round(best.x)}, ${Math.round(best.y)}) size ${Math.round(best.width)}x${Math.round(best.height)}, score=${best.score}`);
 
   return {
+    slotId: best.slotId,
     x: Math.round(best.x),
     y: Math.round(best.y),
     slotWidth: Math.round(best.width),
@@ -174,11 +193,186 @@ async function detectAdSlots(page, targetWidth, targetHeight, device) {
   };
 }
 
+function buildDataUri(imageBuffer, mimeType = 'image/png') {
+  return `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
+}
+
+function buildAdTagSrcDoc(adTag, width, height) {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: ${width}px; height: ${height}px; overflow: hidden; background: #fff; }
+    #adframe-slot { width: 100%; height: 100%; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="adframe-slot">${adTag}</div>
+</body>
+</html>`;
+}
+
+async function injectCreativeIntoDetectedSlot(
+  page,
+  detectedSlot,
+  { adTag = null, adImageBuffer = null, adWidth = 300, adHeight = 250 } = {}
+) {
+  if (!detectedSlot?.slotId) {
+    return { succeeded: false, reason: 'no-slot' };
+  }
+
+  const mode = adImageBuffer ? 'image' : adTag ? 'adtag' : null;
+  if (!mode) {
+    return { succeeded: false, reason: 'no-creative' };
+  }
+
+  const payload = {
+    slotId: detectedSlot.slotId,
+    mode,
+    adWidth,
+    adHeight,
+    imageDataUrl: adImageBuffer ? buildDataUri(adImageBuffer) : null,
+    srcdoc: adTag ? buildAdTagSrcDoc(adTag, adWidth, adHeight) : null,
+  };
+
+  const result = await page.evaluate((p) => {
+    const slotEl = document.querySelector(`[data-adframe-slot-id="${p.slotId}"]`);
+    if (!slotEl) {
+      return { succeeded: false, reason: 'slot-not-found' };
+    }
+
+    let hostEl = slotEl;
+    if (slotEl.tagName === 'IFRAME') {
+      const rect = slotEl.getBoundingClientRect();
+      const replacement = document.createElement('div');
+      replacement.setAttribute('data-adframe-slot-id', p.slotId);
+      replacement.style.width = `${Math.max(1, Math.round(rect.width || p.adWidth))}px`;
+      replacement.style.height = `${Math.max(1, Math.round(rect.height || p.adHeight))}px`;
+      replacement.style.display = 'block';
+      replacement.style.overflow = 'hidden';
+      slotEl.replaceWith(replacement);
+      hostEl = replacement;
+    }
+
+    while (hostEl.firstChild) {
+      hostEl.removeChild(hostEl.firstChild);
+    }
+
+    const computed = getComputedStyle(hostEl);
+    if (computed.position === 'static') {
+      hostEl.style.position = 'relative';
+    }
+    hostEl.style.overflow = 'hidden';
+    if (hostEl.getBoundingClientRect().height < 20) {
+      hostEl.style.minHeight = `${p.adHeight}px`;
+    }
+    if (hostEl.getBoundingClientRect().width < 20) {
+      hostEl.style.minWidth = `${p.adWidth}px`;
+    }
+
+    const creative = document.createElement('div');
+    creative.style.width = '100%';
+    creative.style.height = '100%';
+    creative.style.minWidth = `${p.adWidth}px`;
+    creative.style.minHeight = `${p.adHeight}px`;
+    creative.style.background = '#fff';
+
+    if (p.mode === 'image') {
+      const img = document.createElement('img');
+      img.src = p.imageDataUrl;
+      img.alt = 'Ad creative';
+      img.style.width = '100%';
+      img.style.height = '100%';
+      img.style.display = 'block';
+      img.style.objectFit = 'fill';
+      creative.appendChild(img);
+    } else {
+      const iframe = document.createElement('iframe');
+      iframe.srcdoc = p.srcdoc;
+      iframe.setAttribute('scrolling', 'no');
+      iframe.setAttribute('frameborder', '0');
+      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox');
+      iframe.setAttribute('data-adframe-injected', 'true');
+      iframe.style.width = '100%';
+      iframe.style.height = '100%';
+      iframe.style.border = '0';
+      iframe.style.display = 'block';
+      creative.appendChild(iframe);
+    }
+
+    hostEl.appendChild(creative);
+
+    const badge = document.createElement('div');
+    badge.textContent = 'AD';
+    badge.style.position = 'absolute';
+    badge.style.top = '0';
+    badge.style.left = '0';
+    badge.style.padding = '2px 6px';
+    badge.style.background = '#FF6B35';
+    badge.style.color = '#fff';
+    badge.style.fontFamily = 'Arial, sans-serif';
+    badge.style.fontSize = '10px';
+    badge.style.fontWeight = '700';
+    badge.style.lineHeight = '1.2';
+    badge.style.zIndex = '2147483647';
+    badge.style.pointerEvents = 'none';
+    hostEl.appendChild(badge);
+
+    const rect = hostEl.getBoundingClientRect();
+    return {
+      succeeded: true,
+      mode: p.mode,
+      x: Math.round(rect.left + window.scrollX),
+      y: Math.round(rect.top + window.scrollY),
+      slotWidth: Math.round(rect.width),
+      slotHeight: Math.round(rect.height),
+    };
+  }, payload);
+
+  if (!result?.succeeded) {
+    return result || { succeeded: false, reason: 'inject-failed' };
+  }
+
+  if (mode === 'adtag') {
+    await page.evaluate((slotId) => {
+      return new Promise((resolve) => {
+        const host = document.querySelector(`[data-adframe-slot-id="${slotId}"]`);
+        const iframe = host?.querySelector('iframe[data-adframe-injected="true"]');
+        if (!iframe) {
+          resolve(false);
+          return;
+        }
+        let settled = false;
+        const done = () => {
+          if (settled) return;
+          settled = true;
+          resolve(true);
+        };
+        iframe.addEventListener('load', done, { once: true });
+        setTimeout(done, 3000);
+      });
+    }, detectedSlot.slotId);
+  }
+
+  await new Promise(r => setTimeout(r, mode === 'adtag' ? 1000 : 250));
+
+  return result;
+}
+
 /**
  * Capture a screenshot of a website with consent handling.
  * Also detects ad slot positions for placement.
  */
-async function captureWebsite(url, device = 'desktop', adWidth = 300, adHeight = 250, onProgress = () => {}) {
+async function captureWebsite(
+  url,
+  device = 'desktop',
+  adWidth = 300,
+  adHeight = 250,
+  onProgress = () => {},
+  injectionOptions = null
+) {
   const browser = await getBrowser();
   const page = await browser.newPage();
 
@@ -222,6 +416,16 @@ async function captureWebsite(url, device = 'desktop', adWidth = 300, adHeight =
     // Detect ad slots BEFORE taking the screenshot
     const detectedSlot = await detectAdSlots(page, adWidth, adHeight, device);
 
+    let domInjection = { succeeded: false, reason: 'not-attempted' };
+    if (injectionOptions) {
+      onProgress('Injecting ad creative...');
+      domInjection = await injectCreativeIntoDetectedSlot(page, detectedSlot, {
+        ...injectionOptions,
+        adWidth,
+        adHeight,
+      });
+    }
+
     onProgress('Taking screenshot...');
 
     const screenshot = await page.screenshot({
@@ -241,6 +445,7 @@ async function captureWebsite(url, device = 'desktop', adWidth = 300, adHeight =
       consentHandled,
       device,
       detectedSlot,
+      domInjection,
     };
   } finally {
     await page.close();
@@ -377,4 +582,5 @@ module.exports = {
   closeBrowser,
   getBrowser,
   detectAdSlots,
+  injectCreativeIntoDetectedSlot,
 };

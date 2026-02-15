@@ -6,7 +6,7 @@ const sharp = require('sharp');
 const path = require('path');
 const fs = require('fs');
 const { captureWebsite } = require('../services/puppeteer');
-const { generateMockup } = require('../services/ad-injector');
+const { generateMockup, getAdSizeName } = require('../services/ad-injector');
 const { isBlockedDomain } = require('../services/gemini');
 const queue = require('../utils/queue');
 
@@ -103,9 +103,37 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     // Generate mockup via queue
     const result = await queue.run(async () => {
       // Step 1: Capture website screenshot (also detects ad slot positions)
-      const captureResult = await captureWebsite(url, deviceType, adWidth, adHeight);
+      const captureResult = await captureWebsite(
+        url,
+        deviceType,
+        adWidth,
+        adHeight,
+        () => {},
+        {
+          adTag: adTag || null,
+          adImageBuffer: adImage ? adImage.buffer : null,
+        }
+      );
 
-      // Step 2: Composite ad onto screenshot using detected slot position
+      // Preferred path: inject creative into detected slot in live DOM and screenshot the page.
+      if (captureResult.domInjection?.succeeded) {
+        const placement = {
+          x: captureResult.domInjection.x,
+          y: captureResult.domInjection.y,
+          adSize,
+          adSizeName: getAdSizeName(adSize),
+          method: 'dom-injected',
+          adTagRendered: Boolean(adTag),
+        };
+
+        return {
+          mockup: captureResult.screenshot,
+          placement,
+          consentHandled: captureResult.consentHandled,
+        };
+      }
+
+      // Fallback path: composite ad onto screenshot when direct DOM injection fails.
       const mockupResult = await generateMockup({
         screenshotBuffer: captureResult.screenshot,
         dimensions: captureResult.dimensions,
