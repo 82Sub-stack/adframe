@@ -597,28 +597,39 @@ async function captureWebsite(
       viewportHeight: window.innerHeight,
     }));
 
-    const shouldTruncate = rawDimensions.height > MAX_CAPTURE_HEIGHT;
-    const screenshotOptions = shouldTruncate
-      ? {
-          type: 'png',
-          clip: {
-            x: 0,
-            y: 0,
-            width: Math.max(1, Math.min(rawDimensions.width, viewport.width)),
-            height: MAX_CAPTURE_HEIGHT,
-          },
-        }
-      : {
-          type: 'png',
-          fullPage: true,
-        };
+    const referenceY = domInjection.succeeded
+      ? domInjection.y
+      : detectedSlot?.y ?? Math.floor(rawDimensions.viewportHeight * 0.6);
+    const referenceHeight = domInjection.succeeded
+      ? domInjection.slotHeight
+      : detectedSlot?.slotHeight ?? adHeight;
+
+    const desiredBottom = Math.max(
+      rawDimensions.viewportHeight + 100,
+      Math.round(referenceY + referenceHeight + 260)
+    );
+    const clipHeight = Math.max(
+      Math.min(rawDimensions.viewportHeight, MAX_CAPTURE_HEIGHT),
+      Math.min(rawDimensions.height, Math.min(MAX_CAPTURE_HEIGHT, desiredBottom))
+    );
+
+    const screenshotOptions = {
+      type: 'png',
+      clip: {
+        x: 0,
+        y: 0,
+        width: Math.max(1, Math.min(rawDimensions.width, viewport.width)),
+        height: Math.max(320, clipHeight),
+      },
+    };
     const screenshot = await page.screenshot(screenshotOptions);
 
     const dimensions = {
       ...rawDimensions,
       fullHeight: rawDimensions.height,
-      height: shouldTruncate ? MAX_CAPTURE_HEIGHT : rawDimensions.height,
-      truncated: shouldTruncate,
+      height: screenshotOptions.clip.height,
+      truncated: screenshotOptions.clip.height < rawDimensions.height,
+      viewportCropped: true,
     };
 
     return {

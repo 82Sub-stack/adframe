@@ -1,6 +1,6 @@
-import { Globe, Loader2, ExternalLink, AlertCircle } from 'lucide-react';
+import { Globe, ExternalLink, AlertCircle } from 'lucide-react';
 
-export default function WebsiteSuggestions({ suggestions, loading, error, selectedUrl, onSelect }) {
+export default function WebsiteSuggestions({ suggestions, loading, error, selectedUrls = [], onToggle }) {
   if (loading) {
     return (
       <div className="mt-4">
@@ -36,22 +36,22 @@ export default function WebsiteSuggestions({ suggestions, loading, error, select
   return (
     <div className="mt-4">
       <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-2">
-        Suggested Websites
+        Suggested Websites (select up to 2)
       </label>
       <div className="space-y-2">
         {suggestions.map((site, idx) => (
           <button
             key={idx}
             type="button"
-            onClick={() => onSelect(site.url)}
+            onClick={() => onToggle(site.url)}
             className={`w-full flex items-start gap-3 p-3 rounded-lg border text-left transition-all ${
-              selectedUrl === site.url
+              selectedUrls.includes(site.url)
                 ? 'border-accent bg-accent/5 ring-1 ring-accent/20'
                 : 'border-gray-200 hover:border-gray-300 hover:bg-gray-50'
             }`}
           >
             <div className={`w-8 h-8 rounded-full flex items-center justify-center shrink-0 ${
-              selectedUrl === site.url ? 'bg-accent text-white' : 'bg-gray-100 text-text-muted'
+              selectedUrls.includes(site.url) ? 'bg-accent text-white' : 'bg-gray-100 text-text-muted'
             }`}>
               <Globe size={16} />
             </div>
@@ -63,6 +63,12 @@ export default function WebsiteSuggestions({ suggestions, loading, error, select
               <div className="text-xs text-text-muted truncate">{site.url}</div>
               <div className="text-xs text-text-muted mt-0.5 leading-relaxed">{site.reason}</div>
             </div>
+            <input
+              type="checkbox"
+              checked={selectedUrls.includes(site.url)}
+              readOnly
+              className="mt-1"
+            />
           </button>
         ))}
       </div>

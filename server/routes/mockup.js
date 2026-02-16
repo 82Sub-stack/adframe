@@ -34,6 +34,18 @@ if (!fs.existsSync(outputDir)) {
   fs.mkdirSync(outputDir, { recursive: true });
 }
 
+const TOPIC_PATH_HINTS = {
+  sports: ['sport', 'sports', 'soccer', 'football', 'fussball'],
+  soccer: ['soccer', 'football', 'fussball', 'sport'],
+  finance: ['finance', 'money', 'wirtschaft', 'boerse', 'business'],
+  news: ['news', 'politik', 'world', 'nachrichten'],
+  tech: ['tech', 'technology', 'it', 'digital', 'ki', 'ai'],
+  automotive: ['auto', 'automotive', 'cars', 'mobilitaet'],
+  travel: ['travel', 'reisen', 'urlaub'],
+  cooking: ['cooking', 'rezepte', 'food', 'recipe', 'essen'],
+  lifestyle: ['lifestyle', 'leben', 'style'],
+};
+
 function parseBoolean(value, defaultValue = false) {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'number') return value !== 0;
@@ -45,9 +57,126 @@ function parseBoolean(value, defaultValue = false) {
   return defaultValue;
 }
 
+function unique(items) {
+  return [...new Set(items.filter(Boolean))];
+}
+
+function getTopicKeywords(topic) {
+  if (!topic || typeof topic !== 'string') return [];
+  const cleaned = topic.trim().toLowerCase();
+  if (!cleaned) return [];
+
+  const tokens = cleaned.split(/[^a-z0-9]+/).filter(Boolean);
+  const expanded = [...tokens];
+
+  for (const token of tokens) {
+    if (TOPIC_PATH_HINTS[token]) {
+      expanded.push(...TOPIC_PATH_HINTS[token]);
+    }
+  }
+
+  if (tokens.includes('ai')) {
+    expanded.push('ki', 'artificial-intelligence');
+  }
+
+  return unique(expanded).slice(0, 8);
+}
+
+function buildTopicCandidates(baseUrl, topicKeywords) {
+  const parsed = new URL(baseUrl);
+  const hostname = parsed.hostname.replace(/^www\./, '');
+  const labels = hostname.split('.');
+  const candidates = [baseUrl];
+
+  if ((parsed.pathname || '/') !== '/') {
+    return unique(candidates);
+  }
+
+  const baseDomain = labels.length >= 2 ? labels.slice(-2).join('.') : hostname;
+
+  for (const keyword of topicKeywords) {
+    candidates.push(`${parsed.protocol}//${hostname}/${keyword}`);
+    candidates.push(`${parsed.protocol}//${hostname}/${keyword}/`);
+    candidates.push(`${parsed.protocol}//${hostname}/topic/${keyword}`);
+    candidates.push(`${parsed.protocol}//${hostname}/tag/${keyword}`);
+    candidates.push(`${parsed.protocol}//${hostname}/thema/${keyword}`);
+    candidates.push(`${parsed.protocol}//${hostname}/rubrik/${keyword}`);
+    candidates.push(`${parsed.protocol}//${keyword}.${baseDomain}/`);
+  }
+
+  return unique(candidates);
+}
+
+async function scoreTopicCandidate(candidateUrl, topicKeywords) {
+  const timeoutMs = 4500;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(candidateUrl, {
+      method: 'GET',
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; AdFrame/1.0; +https://adframe.local)',
+        'Accept': 'text/html,application/xhtml+xml',
+      },
+    });
+
+    if (!response.ok) return null;
+
+    const finalUrl = response.url || candidateUrl;
+    const finalPath = new URL(finalUrl).pathname.toLowerCase();
+    const html = (await response.text()).toLowerCase().slice(0, 120000);
+    const headText = html.slice(0, 4000);
+
+    let score = 0;
+    for (const keyword of topicKeywords) {
+      if (finalPath.includes(`/${keyword}`)) score += 10;
+      if (finalPath.includes(keyword)) score += 5;
+      if (headText.includes(keyword)) score += 2;
+    }
+
+    // Prefer URLs that are not homepage root when topic is specified.
+    if (finalPath !== '/') score += 6;
+
+    return {
+      url: finalUrl,
+      score,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveTopicAwareUrl(url, topic) {
+  const topicKeywords = getTopicKeywords(topic);
+  if (topicKeywords.length === 0) {
+    return url;
+  }
+
+  const parsed = new URL(url);
+  if ((parsed.pathname || '/') !== '/') {
+    return url;
+  }
+
+  const candidates = buildTopicCandidates(url, topicKeywords).slice(0, 16);
+  const results = await Promise.all(candidates.map((candidate) => scoreTopicCandidate(candidate, topicKeywords)));
+  const valid = results.filter(Boolean);
+  const best = valid.sort((a, b) => b.score - a.score)[0];
+
+  if (best && best.score >= 8) {
+    return best.url;
+  }
+
+  return url;
+}
+
 router.post('/', upload.single('adImage'), async (req, res) => {
   try {
-    const { websiteUrl, adSize, device, adTag, allowHeuristicFallback } = req.body;
+    const { websiteUrl, topic, adSize, device, adTag, allowHeuristicFallback } = req.body;
     const adImage = req.file;
     const allowHeuristicFallbackEnabled = parseBoolean(allowHeuristicFallback, false);
 
@@ -101,6 +230,14 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     if (!url.startsWith('http://') && !url.startsWith('https://')) {
       url = 'https://' + url;
     }
+
+    if (isBlockedDomain(url)) {
+      return res.status(400).json({
+        error: 'This domain is not supported for mockups (social platforms, search engines, ecommerce, and video sites are excluded). Please use a publisher website.',
+      });
+    }
+
+    url = await resolveTopicAwareUrl(url, topic);
 
     // Check blocked domains
     if (isBlockedDomain(url)) {

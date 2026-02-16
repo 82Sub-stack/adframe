@@ -49,6 +49,7 @@ async function suggestWebsites(topic, country) {
 2. Have standard IAB display ad placements
 3. Are freely accessible (no hard paywall blocking all content)
 4. Have a desktop and mobile version
+5. URL should point to a topic-relevant section/subdomain/path whenever possible (not generic homepage unless no section URL exists)
 
 IMPORTANT: Do NOT suggest any of the following domains (social platforms, search engines, aggregators, ecommerce, video platforms):
 ${blockedList}
@@ -60,7 +61,7 @@ Respond ONLY in this exact JSON format, no other text:
 {
   "suggestions": [
     {
-      "url": "https://www.example.com",
+      "url": "https://www.example.com/topic-or-section",
       "name": "Example Publisher",
       "reason": "Brief reason why this fits the topic/country"
     }
