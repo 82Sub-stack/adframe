@@ -12,6 +12,10 @@ const MOBILE_VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: tru
 const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const MAX_CAPTURE_HEIGHT = 10000;
+const DEFAULT_SCROLL_SCAN_PX = Number.parseInt(
+  process.env.CAPTURE_MAX_SCROLL_PX,
+  10
+) || (process.env.NODE_ENV === 'production' ? 2200 : 8000);
 
 let browserInstance = null;
 
@@ -392,6 +396,11 @@ async function injectCreativeIntoDetectedSlot(
         return { succeeded: false, reason: 'content-like-slot' };
       }
 
+      // Lock explicit dimensions before clearing children so the slot
+      // does not collapse when its content-derived height is removed.
+      hostEl.style.width = `${Math.max(1, Math.round(rectBefore.width || p.fallbackWidth))}px`;
+      hostEl.style.height = `${Math.max(1, Math.round(rectBefore.height || p.fallbackHeight))}px`;
+
       while (hostEl.firstChild) {
         hostEl.removeChild(hostEl.firstChild);
       }
@@ -543,7 +552,8 @@ async function captureWebsite(
 
     onProgress('Scrolling page...');
 
-    await autoScroll(page);
+    // Limit scroll depth in production to avoid loading very long pages into memory.
+    await autoScroll(page, DEFAULT_SCROLL_SCAN_PX);
     await page.evaluate(() => window.scrollTo(0, 0));
     await new Promise(r => setTimeout(r, 1000));
 
@@ -580,9 +590,23 @@ async function captureWebsite(
 
     let domInjection = { succeeded: false, reason: 'not-attempted' };
     if (injectionOptions) {
+      // Pre-render ad tags to a static image before DOM injection.
+      // Ad libraries (e.g. Adition) use document.write() which breaks inside
+      // srcdoc iframes because the document is already fully parsed.
+      // Rendering to PNG first via a data-URL page avoids this entirely.
+      const effectiveOptions = { ...injectionOptions };
+      if (effectiveOptions.adTag && !effectiveOptions.adImageBuffer) {
+        onProgress('Rendering ad tag...');
+        const renderedAd = await renderAdTag(effectiveOptions.adTag, adWidth, adHeight);
+        if (renderedAd) {
+          effectiveOptions.adImageBuffer = renderedAd;
+          effectiveOptions.adTag = null;
+        }
+      }
+
       onProgress('Injecting ad creative...');
       domInjection = await injectCreativeIntoDetectedSlot(page, detectedSlot, {
-        ...injectionOptions,
+        ...effectiveOptions,
         adWidth,
         adHeight,
         slotCandidates,
@@ -745,8 +769,8 @@ async function renderAdTag(adTag, width, height) {
 /**
  * Auto-scroll the page to trigger lazy-loaded content.
  */
-async function autoScroll(page) {
-  await page.evaluate(async () => {
+async function autoScroll(page, maxScrollPx = 2400) {
+  await page.evaluate(async (maxPx) => {
     await new Promise((resolve) => {
       let totalHeight = 0;
       const distance = 400;
@@ -754,13 +778,13 @@ async function autoScroll(page) {
         const scrollHeight = document.documentElement.scrollHeight;
         window.scrollBy(0, distance);
         totalHeight += distance;
-        if (totalHeight >= scrollHeight || totalHeight > 8000) {
+        if (totalHeight >= scrollHeight || totalHeight >= maxPx) {
           clearInterval(timer);
           resolve();
         }
-      }, 150);
+      }, 120);
     });
-  });
+  }, maxScrollPx);
 }
 
 async function closeBrowser() {

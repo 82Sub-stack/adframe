@@ -127,7 +127,7 @@ async function scoreTopicCandidate(candidateUrl, topicKeywords) {
 
     const finalUrl = response.url || candidateUrl;
     const finalPath = new URL(finalUrl).pathname.toLowerCase();
-    const html = (await response.text()).toLowerCase().slice(0, 120000);
+    const html = (await response.text()).toLowerCase().slice(0, 40000);
     const headText = html.slice(0, 4000);
 
     let score = 0;
@@ -162,7 +162,7 @@ async function resolveTopicAwareUrl(url, topic) {
     return url;
   }
 
-  const candidates = buildTopicCandidates(url, topicKeywords).slice(0, 16);
+  const candidates = buildTopicCandidates(url, topicKeywords).slice(0, 8);
   const results = await Promise.all(candidates.map((candidate) => scoreTopicCandidate(candidate, topicKeywords)));
   const valid = results.filter(Boolean);
   const best = valid.sort((a, b) => b.score - a.score)[0];
@@ -354,8 +354,9 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     });
   } catch (err) {
     console.error('Mockup generation error:', err);
+    const message = err?.message || '';
 
-    if (err.message?.includes('timeout') || err.message?.includes('Timeout')) {
+    if (message.includes('timeout') || message.includes('Timeout')) {
       return res.status(504).json({
         error: 'Page load timed out. Try a different website or check the URL.',
       });
@@ -364,6 +365,14 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     if (err.code === 'NO_RELIABLE_SLOT') {
       return res.status(422).json({
         error: err.message,
+      });
+    }
+
+    if (
+      /Target closed|Session closed|browser has disconnected|ENOMEM|heap out of memory|Cannot find context/i.test(message)
+    ) {
+      return res.status(503).json({
+        error: 'Mockup generation failed due to temporary server resource limits. Please retry in a moment.',
       });
     }
 
