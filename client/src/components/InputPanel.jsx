@@ -5,11 +5,6 @@ import DeviceToggle from './DeviceToggle';
 import AdSizeSelector from './AdSizeSelector';
 import WebsiteSuggestions from './WebsiteSuggestions';
 
-const TOPICS = [
-  'Sports', 'Finance', 'News', 'Tech', 'Automotive',
-  'Lifestyle', 'Cooking', 'Travel',
-];
-
 const COUNTRIES = [
   'Germany', 'Austria', 'Switzerland', 'United Kingdom',
   'France', 'Italy', 'Spain', 'Netherlands', 'Poland',
@@ -17,7 +12,6 @@ const COUNTRIES = [
 
 export default function InputPanel({ onResult, onGenerating, onProgress, onError }) {
   const [topic, setTopic] = useState('');
-  const [customTopic, setCustomTopic] = useState('');
   const [country, setCountry] = useState('');
   const [device, setDevice] = useState('desktop');
   const [adSize, setAdSize] = useState('300x250');
@@ -26,18 +20,16 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
   const [adImage, setAdImage] = useState(null);
   const [adImagePreview, setAdImagePreview] = useState(null);
   const [allowHeuristicFallback, setAllowHeuristicFallback] = useState(false);
+  const [mockupCount, setMockupCount] = useState(2);
   const [overrideUrl, setOverrideUrl] = useState('');
   const [suggestions, setSuggestions] = useState(null);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [suggestionsError, setSuggestionsError] = useState(null);
-  const [selectedUrl, setSelectedUrl] = useState('');
+  const [selectedUrls, setSelectedUrls] = useState([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const fileInputRef = useRef(null);
 
-  const effectiveTopic = topic === 'custom' ? customTopic : topic;
-
-  // Reset ad size when device changes
   const handleDeviceChange = (newDevice) => {
     setDevice(newDevice);
     const desktopOnly = ['728x90', '160x600', '970x250'];
@@ -64,17 +56,30 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const toggleSuggestedUrl = (url) => {
+    setSelectedUrls((prev) => {
+      if (prev.includes(url)) {
+        return prev.filter((entry) => entry !== url);
+      }
+      if (prev.length >= 2) {
+        return [prev[1], url];
+      }
+      return [...prev, url];
+    });
+  };
+
   const fetchSuggestions = async () => {
-    if (!effectiveTopic || !country) return;
+    const cleanedTopic = topic.trim();
+    if (!cleanedTopic || !country) return;
 
     setSuggestionsLoading(true);
     setSuggestionsError(null);
     setSuggestions(null);
-    setSelectedUrl('');
+    setSelectedUrls([]);
 
     try {
       const res = await axios.post('/api/suggest-websites', {
-        topic: effectiveTopic,
+        topic: cleanedTopic,
         country,
       });
       setSuggestions(res.data.suggestions);
@@ -87,48 +92,93 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
     }
   };
 
+  const buildTargetUrls = () => {
+    const desiredCount = mockupCount;
+    const candidates = [];
+
+    const customUrl = overrideUrl.trim();
+    if (customUrl) {
+      candidates.push(customUrl);
+    }
+
+    for (const url of selectedUrls) {
+      if (!candidates.includes(url)) {
+        candidates.push(url);
+      }
+    }
+
+    if (candidates.length === 0) {
+      return { error: 'Please select website suggestions or enter a specific URL' };
+    }
+
+    if (candidates.length < desiredCount) {
+      return {
+        error: desiredCount === 2
+          ? 'Please select two websites (or add one custom URL and one suggested URL)'
+          : 'Please select at least one website',
+      };
+    }
+
+    return { urls: candidates.slice(0, desiredCount) };
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     onError(null);
 
-    const websiteUrl = overrideUrl || selectedUrl;
-    if (!websiteUrl) {
-      onError('Please select a website or enter a URL');
+    const cleanedTopic = topic.trim();
+    if (!cleanedTopic) {
+      onError('Please enter a topic to match relevant site sections');
       return;
     }
+
     if (!adTag && !adImage) {
       onError('Please provide an ad tag or upload an ad image');
       return;
     }
 
+    const target = buildTargetUrls();
+    if (target.error) {
+      onError(target.error);
+      return;
+    }
+
+    const urls = target.urls;
     setIsSubmitting(true);
     onGenerating(true);
-    onProgress('Selecting website...');
+    onProgress('Generating mockups...');
     onResult(null);
 
     try {
-      const formData = new FormData();
-      formData.append('websiteUrl', websiteUrl);
-      formData.append('adSize', adSize);
-      formData.append('device', device);
-      formData.append('allowHeuristicFallback', String(allowHeuristicFallback));
+      const results = [];
 
-      if (adTag) {
-        formData.append('adTag', adTag);
+      for (let index = 0; index < urls.length; index++) {
+        const websiteUrl = urls[index];
+        onProgress(`Generating mockup ${index + 1}/${urls.length}...`);
+
+        const formData = new FormData();
+        formData.append('websiteUrl', websiteUrl);
+        formData.append('topic', cleanedTopic);
+        formData.append('adSize', adSize);
+        formData.append('device', device);
+        formData.append('allowHeuristicFallback', String(allowHeuristicFallback));
+
+        if (adTag) {
+          formData.append('adTag', adTag);
+        }
+        if (adImage) {
+          formData.append('adImage', adImage);
+        }
+
+        const res = await axios.post('/api/generate-mockup', formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          timeout: 120000,
+        });
+
+        results.push(res.data);
       }
-      if (adImage) {
-        formData.append('adImage', adImage);
-      }
 
-      const res = await axios.post('/api/generate-mockup', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        timeout: 120000, // 2 minute timeout
-        onUploadProgress: () => {
-          onProgress('Loading page...');
-        },
-      });
-
-      onResult(res.data);
+      onResult(results);
       onProgress('');
     } catch (err) {
       const msg = err.response?.data?.error || 'Failed to generate mockup. Please try again.';
@@ -139,9 +189,10 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
     }
   };
 
+  const hasAnyUrl = overrideUrl.trim().length > 0 || selectedUrls.length > 0;
+
   return (
     <form onSubmit={handleSubmit} className="p-5 space-y-5">
-      {/* Header */}
       <div>
         <h1 className="text-lg font-bold text-text-primary">New Mockup</h1>
         <p className="text-xs text-text-muted mt-0.5">
@@ -151,37 +202,22 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
 
       <hr className="border-gray-100" />
 
-      {/* Topic */}
       <div>
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-1.5">
           Topic / Vertical
         </label>
-        <div className="relative">
-          <select
-            value={topic}
-            onChange={(e) => setTopic(e.target.value)}
-            className="w-full appearance-none px-3 py-2.5 pr-8 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20"
-          >
-            <option value="">Select a topic...</option>
-            {TOPICS.map(t => (
-              <option key={t} value={t}>{t}</option>
-            ))}
-            <option value="custom">Other (type below)</option>
-          </select>
-          <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
-        </div>
-        {topic === 'custom' && (
-          <input
-            type="text"
-            value={customTopic}
-            onChange={(e) => setCustomTopic(e.target.value)}
-            placeholder="e.g. Real Estate, Gaming, Health..."
-            className="mt-2 w-full px-3 py-2.5 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20"
-          />
-        )}
+        <input
+          type="text"
+          value={topic}
+          onChange={(e) => setTopic(e.target.value)}
+          placeholder="e.g. sports, soccer, ai security, gaming laptops"
+          className="w-full px-3 py-2.5 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20"
+        />
+        <p className="text-xs text-text-muted mt-1">
+          Used to target matching subdomains/sections (for example, sports pages on news sites).
+        </p>
       </div>
 
-      {/* Country */}
       <div>
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-1.5">
           Country
@@ -193,7 +229,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
             className="w-full appearance-none px-3 py-2.5 pr-8 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20"
           >
             <option value="">Select a country...</option>
-            {COUNTRIES.map(c => (
+            {COUNTRIES.map((c) => (
               <option key={c} value={c}>{c}</option>
             ))}
           </select>
@@ -201,8 +237,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
         </div>
       </div>
 
-      {/* Suggest Websites Button */}
-      {effectiveTopic && country && (
+      {topic.trim() && country && (
         <button
           type="button"
           onClick={fetchSuggestions}
@@ -214,22 +249,20 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
         </button>
       )}
 
-      {/* Website Suggestions */}
       <WebsiteSuggestions
         suggestions={suggestions}
         loading={suggestionsLoading}
         error={suggestionsError}
-        selectedUrl={selectedUrl}
-        onSelect={setSelectedUrl}
+        selectedUrls={selectedUrls}
+        onToggle={toggleSuggestedUrl}
       />
 
-      {/* Override URL */}
       <div>
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-1.5">
           <span className="flex items-center gap-1">
             <Link size={12} />
             Specific Website URL
-            <span className="font-normal normal-case">(optional override)</span>
+            <span className="font-normal normal-case">(optional, can be combined with suggestions)</span>
           </span>
         </label>
         <input
@@ -241,23 +274,49 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
         />
       </div>
 
+      <div>
+        <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-2">
+          Output
+        </label>
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            type="button"
+            onClick={() => setMockupCount(1)}
+            className={`py-2 rounded-lg border text-sm font-medium ${
+              mockupCount === 1
+                ? 'border-accent bg-accent/10 text-accent'
+                : 'border-gray-200 text-text-primary hover:bg-gray-50'
+            }`}
+          >
+            1 Site
+          </button>
+          <button
+            type="button"
+            onClick={() => setMockupCount(2)}
+            className={`py-2 rounded-lg border text-sm font-medium ${
+              mockupCount === 2
+                ? 'border-accent bg-accent/10 text-accent'
+                : 'border-gray-200 text-text-primary hover:bg-gray-50'
+            }`}
+          >
+            2 Sites
+          </button>
+        </div>
+      </div>
+
       <hr className="border-gray-100" />
 
-      {/* Device Toggle */}
       <DeviceToggle value={device} onChange={handleDeviceChange} />
 
-      {/* Ad Size */}
       <AdSizeSelector device={device} value={adSize} onChange={setAdSize} />
 
       <hr className="border-gray-100" />
 
-      {/* Ad Creative */}
       <div>
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-2">
           Ad Creative
         </label>
 
-        {/* Mode toggle */}
         <div className="flex rounded-lg border border-gray-200 overflow-hidden mb-3">
           <button
             type="button"
@@ -303,7 +362,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
                   <X size={12} />
                 </button>
                 <div className="mt-1.5 text-xs text-text-muted">
-                  {adImage?.name} — Dimensions must match {adSize}
+                  {adImage?.name} - Dimensions must match {adSize}
                 </div>
               </div>
             ) : (
@@ -341,7 +400,6 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
 
       <hr className="border-gray-100" />
 
-      {/* Placement behavior */}
       <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
         <label className="flex items-start gap-2 text-xs text-text-primary">
           <input
@@ -361,13 +419,12 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
 
       <hr className="border-gray-100" />
 
-      {/* Submit */}
       <button
         type="submit"
-        disabled={isSubmitting || (!overrideUrl && !selectedUrl)}
+        disabled={isSubmitting || !hasAnyUrl}
         className="w-full py-3 rounded-lg bg-accent text-white font-semibold text-sm hover:bg-accent-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
       >
-        {isSubmitting ? 'Generating...' : 'Generate Mockup'}
+        {isSubmitting ? `Generating ${mockupCount} mockup${mockupCount > 1 ? 's' : ''}...` : `Generate ${mockupCount} Mockup${mockupCount > 1 ? 's' : ''}`}
       </button>
     </form>
   );

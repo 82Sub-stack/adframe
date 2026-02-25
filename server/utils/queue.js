@@ -48,4 +48,13 @@ class ConcurrencyQueue {
   }
 }
 
-module.exports = new ConcurrencyQueue(3);
+function parseConcurrency(value, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return parsed;
+}
+
+const defaultConcurrency = process.env.NODE_ENV === 'production' ? 1 : 3;
+const configuredConcurrency = parseConcurrency(process.env.MOCKUP_CONCURRENCY, defaultConcurrency);
+
+module.exports = new ConcurrencyQueue(configuredConcurrency);

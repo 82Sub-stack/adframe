@@ -1,4 +1,5 @@
-import { Download, FileCode, ExternalLink, AlertTriangle, ImageIcon, RefreshCw } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Download, FileCode, ExternalLink, AlertTriangle, ImageIcon } from 'lucide-react';
 import ProgressLoader from './ProgressLoader';
 import DeviceFrame from './DeviceFrame';
 
@@ -28,6 +29,13 @@ function getPlacementMethodInfo(method) {
 }
 
 export default function PreviewPanel({ result, isGenerating, progressStep, error }) {
+  const mockups = Array.isArray(result) ? result : result ? [result] : [];
+  const [activeIndex, setActiveIndex] = useState(0);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [result]);
+
   if (isGenerating) {
     return <ProgressLoader progressStep={progressStep} />;
   }
@@ -46,7 +54,7 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
     );
   }
 
-  if (!result) {
+  if (mockups.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full px-8">
         <div className="text-center max-w-sm">
@@ -55,21 +63,44 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
           </div>
           <h3 className="text-lg font-semibold text-text-primary mb-2">No Mockup Yet</h3>
           <p className="text-sm text-text-muted leading-relaxed">
-            Select a topic and country, choose a website, upload your ad creative, and generate a mockup to see it here.
+            Enter a topic, choose one or two websites, upload your ad creative, and generate mockups to see them here.
           </p>
         </div>
       </div>
     );
   }
 
-  const { mockupImageUrl, adTagDownloadUrl, metadata } = result;
+  const safeIndex = Math.max(0, Math.min(activeIndex, mockups.length - 1));
+  const current = mockups[safeIndex];
+  const { mockupImageUrl, adTagDownloadUrl, metadata } = current;
   const isMobile = metadata.device === 'mobile';
   const previewUrl = `${mockupImageUrl}/preview`;
   const methodInfo = getPlacementMethodInfo(metadata.placement?.method);
 
   return (
     <div className="p-6">
-      {/* Header with metadata */}
+      {mockups.length > 1 && (
+        <div className="mb-4">
+          <div className="text-xs text-text-muted mb-2">Generated Mockups ({mockups.length})</div>
+          <div className="flex gap-2 flex-wrap">
+            {mockups.map((item, idx) => (
+              <button
+                key={item.mockupId || idx}
+                type="button"
+                onClick={() => setActiveIndex(idx)}
+                className={`px-3 py-1.5 rounded-lg border text-xs ${
+                  safeIndex === idx
+                    ? 'border-accent bg-accent/10 text-accent'
+                    : 'border-gray-200 text-text-primary hover:bg-gray-50'
+                }`}
+              >
+                Site {idx + 1}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="flex items-start justify-between mb-5">
         <div>
           <h2 className="text-lg font-bold text-text-primary">Mockup Preview</h2>
@@ -105,7 +136,6 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
           </div>
         </div>
 
-        {/* Download buttons */}
         <div className="flex gap-2 shrink-0">
           <a
             href={mockupImageUrl}
@@ -128,7 +158,6 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
         </div>
       </div>
 
-      {/* Mockup image */}
       <div className="flex justify-center">
         {isMobile ? (
           <DeviceFrame>
@@ -141,7 +170,6 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
           </DeviceFrame>
         ) : (
           <div className="rounded-lg overflow-hidden shadow-lg border border-gray-200 bg-white">
-            {/* Browser chrome */}
             <div className="flex items-center gap-2 px-3 py-2 bg-gray-100 border-b border-gray-200">
               <div className="flex gap-1.5">
                 <div className="w-2.5 h-2.5 rounded-full bg-red-400" />
@@ -164,7 +192,6 @@ export default function PreviewPanel({ result, isGenerating, progressStep, error
         )}
       </div>
 
-      {/* Placement info */}
       <div className="mt-4 p-3 rounded-lg bg-white border border-gray-200 text-xs text-text-muted">
         <span className="font-medium text-text-primary">Placement:</span>{' '}
         {metadata.placement.adSizeName} ({metadata.adSize}) at position ({metadata.placement.x}, {metadata.placement.y}) via {methodInfo.label}
