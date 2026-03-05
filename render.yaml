@@ -12,5 +12,7 @@ services:
         value: "1"
       - key: CAPTURE_MAX_SCROLL_PX
         value: "2200"
+      - key: CAPTURE_MAX_HEIGHT
+        value: "3600"
       - key: GEMINI_API_KEY
         sync: false

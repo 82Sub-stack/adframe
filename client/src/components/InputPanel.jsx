@@ -172,7 +172,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
 
         const res = await axios.post('/api/generate-mockup', formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
-          timeout: 120000,
+          timeout: 240000,
         });
 
         results.push(res.data);
