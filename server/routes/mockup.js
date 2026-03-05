@@ -248,6 +248,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
 
     // Parse ad dimensions for slot detection
     const [adWidth, adHeight] = adSize.split('x').map(Number);
+    let finalWebsiteUrl = url;
 
     // Generate mockup via queue
     const result = await queue.run(async () => {
@@ -279,6 +280,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
           mockup: captureResult.screenshot,
           placement,
           consentHandled: captureResult.consentHandled,
+          finalUrl: captureResult.finalUrl || url,
         };
       }
 
@@ -301,8 +303,11 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       return {
         ...mockupResult,
         consentHandled: captureResult.consentHandled,
+        finalUrl: captureResult.finalUrl || url,
       };
     });
+
+    finalWebsiteUrl = result.finalUrl || finalWebsiteUrl;
 
     // Store the mockup
     const mockupId = uuidv4();
@@ -312,7 +317,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     mockupStore.set(mockupId, {
       path: mockupPath,
       metadata: {
-        websiteUrl: url,
+        websiteUrl: finalWebsiteUrl,
         adSize,
         device: deviceType,
         placement: result.placement,
@@ -344,7 +349,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       mockupImageUrl: `/api/download-mockup/${mockupId}`,
       adTagDownloadUrl: adTag ? `/api/download-adtag/${mockupId}` : null,
       metadata: {
-        websiteUrl: url,
+        websiteUrl: finalWebsiteUrl,
         adSize,
         adSizeName: result.placement.adSizeName,
         device: deviceType,
@@ -359,6 +364,12 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     if (message.includes('timeout') || message.includes('Timeout')) {
       return res.status(504).json({
         error: 'Page load timed out. Try a different website or check the URL.',
+      });
+    }
+
+    if (/ERR_SSL_VERSION_OR_CIPHER_MISMATCH|ERR_SSL_PROTOCOL_ERROR|ERR_CERT_/i.test(message)) {
+      return res.status(422).json({
+        error: 'The target domain has an SSL/TLS configuration issue for automated browsing. Try the site with "http://" or use an alternate subdomain.',
       });
     }
 

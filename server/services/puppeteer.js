@@ -6,7 +6,11 @@
 const puppeteer = require('puppeteer');
 const { handleConsent, setConsentCookies } = require('./consent-handler');
 
-const DESKTOP_VIEWPORT = { width: 1440, height: 900 };
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const DESKTOP_VIEWPORT = {
+  width: Number.parseInt(process.env.CAPTURE_VIEWPORT_WIDTH, 10) || (IS_PRODUCTION ? 1366 : 1440),
+  height: Number.parseInt(process.env.CAPTURE_VIEWPORT_HEIGHT, 10) || 900,
+};
 const MOBILE_VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: true };
 
 const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -14,11 +18,23 @@ const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleW
 const MAX_CAPTURE_HEIGHT = Number.parseInt(
   process.env.CAPTURE_MAX_HEIGHT,
   10
-) || (process.env.NODE_ENV === 'production' ? 3600 : 10000);
+) || (IS_PRODUCTION ? 3400 : 10000);
 const DEFAULT_SCROLL_SCAN_PX = Number.parseInt(
   process.env.CAPTURE_MAX_SCROLL_PX,
   10
-) || (process.env.NODE_ENV === 'production' ? 2200 : 8000);
+) || (IS_PRODUCTION ? 1600 : 8000);
+const GENERIC_SLOT_SCAN_LIMIT = Number.parseInt(
+  process.env.SLOT_SCAN_LIMIT,
+  10
+) || (IS_PRODUCTION ? 900 : 1800);
+const ADTAG_NAV_TIMEOUT_MS = Number.parseInt(
+  process.env.ADTAG_NAV_TIMEOUT_MS,
+  10
+) || (IS_PRODUCTION ? 10000 : 15000);
+const ADTAG_WAIT_MS = Number.parseInt(
+  process.env.ADTAG_WAIT_MS,
+  10
+) || (IS_PRODUCTION ? 1500 : 3000);
 
 let browserInstance = null;
 
@@ -40,7 +56,10 @@ async function getBrowser() {
     '--disable-renderer-backgrounding',
   ];
 
-  if (process.env.NODE_ENV === 'production') {
+  if (IS_PRODUCTION) {
+    launchArgs.push('--renderer-process-limit=2');
+  }
+  if (process.env.PUPPETEER_SINGLE_PROCESS === 'true') {
     launchArgs.push('--single-process');
   }
 
@@ -62,8 +81,9 @@ async function getBrowser() {
  * Detect existing ad slots/iframes and return ranked candidates.
  */
 async function detectAdSlots(page, targetWidth, targetHeight, device, options = {}) {
-  const maxCandidateY = options.maxCandidateY || (device === 'mobile' ? 2800 : 4200);
-  const slots = await page.evaluate((tw, th) => {
+  const maxCandidateY = options.maxCandidateY || (device === 'mobile' ? 2800 : (IS_PRODUCTION ? 3200 : 4200));
+  const scanLimit = options.scanLimit || GENERIC_SLOT_SCAN_LIMIT;
+  const slots = await page.evaluate((tw, th, maxScanned) => {
     const results = [];
     const slotIds = new WeakMap();
     let slotCounter = 0;
@@ -176,7 +196,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
     const candidates = document.querySelectorAll('div, section, aside');
     let scanned = 0;
     for (const el of candidates) {
-      if (scanned > 1800) break;
+      if (scanned > maxScanned) break;
       scanned++;
 
       const rect = el.getBoundingClientRect();
@@ -206,7 +226,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
     }
 
     return results;
-  }, targetWidth, targetHeight);
+  }, targetWidth, targetHeight, scanLimit);
 
   if (slots.length === 0) {
     return options.returnCandidates ? { bestSlot: null, candidates: [] } : null;
@@ -316,6 +336,104 @@ function buildAdTagSrcDoc(adTag, width, height) {
   <div id="adframe-slot">${adTag}</div>
 </body>
 </html>`;
+}
+
+function isTimeoutError(err) {
+  return err?.name === 'TimeoutError' || /timeout/i.test(err?.message || '');
+}
+
+function isSslError(err) {
+  const message = err?.message || '';
+  return /ERR_SSL_VERSION_OR_CIPHER_MISMATCH|ERR_SSL_PROTOCOL_ERROR|ERR_CERT_/i.test(message);
+}
+
+function isRetryableNetworkError(err) {
+  const message = err?.message || '';
+  return /ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_REFUSED|ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_ABORTED|ERR_TUNNEL_CONNECTION_FAILED/i.test(message);
+}
+
+function buildNavigationCandidates(initialUrl) {
+  try {
+    const parsed = new URL(initialUrl);
+    const hostname = parsed.hostname;
+    const bareHost = hostname.replace(/^www\./i, '');
+    const hostWithWww = bareHost.startsWith('www.') ? bareHost : `www.${bareHost}`;
+    const protocol = parsed.protocol === 'http:' ? 'http:' : 'https:';
+
+    const basePath = `${parsed.pathname || '/'}${parsed.search || ''}${parsed.hash || ''}`;
+    const candidates = [];
+
+    const pushUrl = (proto, host) => {
+      if (!host) return;
+      const value = `${proto}//${host}${basePath}`;
+      if (!candidates.includes(value)) candidates.push(value);
+    };
+
+    pushUrl(protocol, hostname);
+    if (protocol === 'https:') {
+      pushUrl('https:', hostWithWww);
+      pushUrl('http:', hostname);
+      pushUrl('http:', hostWithWww);
+    } else {
+      pushUrl('http:', hostWithWww);
+      pushUrl('https:', hostname);
+      pushUrl('https:', hostWithWww);
+    }
+
+    return candidates;
+  } catch {
+    return [initialUrl];
+  }
+}
+
+async function navigatePage(page, url) {
+  if (IS_PRODUCTION) {
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 22000,
+    });
+    await new Promise(r => setTimeout(r, 1200));
+    return page.url();
+  }
+
+  try {
+    await page.goto(url, {
+      waitUntil: 'networkidle2',
+      timeout: 25000,
+    });
+    return page.url();
+  } catch (err) {
+    if (!isTimeoutError(err)) throw err;
+    console.warn(`Primary navigation timed out for ${url}, retrying with domcontentloaded`);
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 20000,
+    });
+    await new Promise(r => setTimeout(r, 1500));
+    return page.url();
+  }
+}
+
+async function navigateWithFallbacks(page, initialUrl) {
+  const candidates = buildNavigationCandidates(initialUrl);
+  let lastError = null;
+
+  for (const candidateUrl of candidates) {
+    try {
+      await setConsentCookies(page, candidateUrl);
+      const finalUrl = await navigatePage(page, candidateUrl);
+      return finalUrl;
+    } catch (err) {
+      lastError = err;
+      const canRetry = candidateUrl !== candidates[candidates.length - 1];
+      if ((isSslError(err) || isRetryableNetworkError(err) || isTimeoutError(err)) && canRetry) {
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw lastError || new Error(`Failed to navigate to ${initialUrl}`);
 }
 
 async function injectCreativeIntoDetectedSlot(
@@ -532,28 +650,11 @@ async function captureWebsite(
 
     onProgress('Loading page...');
 
-    // Set consent cookies before first navigation to reduce CMP blocking.
-    await setConsentCookies(page, url);
-
-    try {
-      await page.goto(url, {
-        waitUntil: 'networkidle2',
-        timeout: 25000,
-      });
-    } catch (err) {
-      const isTimeout = err.name === 'TimeoutError' || err.message?.includes('timeout');
-      if (!isTimeout) throw err;
-      console.warn(`Primary navigation timed out for ${url}, retrying with domcontentloaded`);
-      await page.goto(url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 20000,
-      });
-      await new Promise(r => setTimeout(r, 1500));
-    }
+    const finalUrl = await navigateWithFallbacks(page, url);
 
     onProgress('Handling consent banners...');
 
-    const consentHandled = await handleConsent(page, url);
+    const consentHandled = await handleConsent(page, finalUrl);
 
     onProgress('Scrolling page...');
 
@@ -669,13 +770,18 @@ async function captureWebsite(
       screenshot: Buffer.from(screenshot),
       dimensions,
       consentHandled,
+      finalUrl,
       device,
       detectedSlot,
       slotCandidates,
       domInjection,
     };
   } finally {
-    await page.close();
+    try {
+      await page.close();
+    } catch (err) {
+      console.warn('Failed to close capture page cleanly:', err?.message || err);
+    }
   }
 }
 
@@ -689,6 +795,15 @@ async function renderAdTag(adTag, width, height) {
 
   try {
     await page.setViewport({ width: width + 20, height: height + 20 });
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const type = req.resourceType();
+      if (['media', 'font'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
 
     // Determine the ad tag type
     const trimmed = adTag.trim();
@@ -701,8 +816,8 @@ async function renderAdTag(adTag, width, height) {
       if (srcMatch) {
         const iframeSrc = srcMatch[1];
         console.log(`Ad tag: rendering iframe src directly: ${iframeSrc.substring(0, 80)}...`);
-        await page.goto(iframeSrc, { waitUntil: 'networkidle2', timeout: 15000 });
-        await new Promise(r => setTimeout(r, 2000));
+        await page.goto(iframeSrc, { waitUntil: 'domcontentloaded', timeout: ADTAG_NAV_TIMEOUT_MS });
+        await new Promise(r => setTimeout(r, ADTAG_WAIT_MS));
 
         const screenshot = await page.screenshot({
           type: 'png',
@@ -724,8 +839,8 @@ async function renderAdTag(adTag, width, height) {
       // Navigate to a data URL so scripts can execute (setContent blocks some script execution)
       const dataUrl = 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
       console.log('Ad tag: rendering via data URL (has scripts)');
-      await page.goto(dataUrl, { waitUntil: 'networkidle2', timeout: 15000 });
-      await new Promise(r => setTimeout(r, 3000)); // Extra wait for ad scripts
+      await page.goto(dataUrl, { waitUntil: 'domcontentloaded', timeout: ADTAG_NAV_TIMEOUT_MS });
+      await new Promise(r => setTimeout(r, ADTAG_WAIT_MS));
 
     } else {
       // Plain HTML creative (images, divs, etc.)
@@ -737,8 +852,8 @@ async function renderAdTag(adTag, width, height) {
 </body></html>`;
 
       console.log('Ad tag: rendering plain HTML creative');
-      await page.setContent(html, { waitUntil: 'networkidle2', timeout: 15000 });
-      await new Promise(r => setTimeout(r, 2000));
+      await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: ADTAG_NAV_TIMEOUT_MS });
+      await new Promise(r => setTimeout(r, Math.max(1000, ADTAG_WAIT_MS - 250)));
     }
 
     // Check if anything actually rendered (not just a white box)
@@ -771,7 +886,11 @@ async function renderAdTag(adTag, width, height) {
     console.error('Ad tag rendering failed:', err.message);
     return null;
   } finally {
-    await page.close();
+    try {
+      await page.close();
+    } catch (err) {
+      console.warn('Failed to close adtag page cleanly:', err?.message || err);
+    }
   }
 }
 
