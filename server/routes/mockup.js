@@ -108,7 +108,7 @@ function buildTopicCandidates(baseUrl, topicKeywords) {
 }
 
 async function scoreTopicCandidate(candidateUrl, topicKeywords) {
-  const timeoutMs = 4500;
+  const timeoutMs = 2500;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 

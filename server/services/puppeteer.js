@@ -11,7 +11,10 @@ const MOBILE_VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: tru
 
 const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
-const MAX_CAPTURE_HEIGHT = 10000;
+const MAX_CAPTURE_HEIGHT = Number.parseInt(
+  process.env.CAPTURE_MAX_HEIGHT,
+  10
+) || (process.env.NODE_ENV === 'production' ? 3600 : 10000);
 const DEFAULT_SCROLL_SCAN_PX = Number.parseInt(
   process.env.CAPTURE_MAX_SCROLL_PX,
   10
@@ -59,6 +62,7 @@ async function getBrowser() {
  * Detect existing ad slots/iframes and return ranked candidates.
  */
 async function detectAdSlots(page, targetWidth, targetHeight, device, options = {}) {
+  const maxCandidateY = options.maxCandidateY || (device === 'mobile' ? 2800 : 4200);
   const slots = await page.evaluate((tw, th) => {
     const results = [];
     const slotIds = new WeakMap();
@@ -265,6 +269,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
   const candidates = scored
     .filter((c) => c.score >= 55)
     .filter((c) => c.isAd || c.type === 'iframe' || c.type === 'gpt')
+    .filter((c) => c.y >= 0 && c.y <= maxCandidateY)
     .slice(0, 8)
     .map((c) => ({
       slotId: c.slotId,
@@ -628,9 +633,13 @@ async function captureWebsite(
       ? domInjection.slotHeight
       : detectedSlot?.slotHeight ?? adHeight;
 
+    const normalizedReferenceY = referenceY > rawDimensions.viewportHeight * 3
+      ? Math.floor(rawDimensions.viewportHeight * 1.2)
+      : referenceY;
+
     const desiredBottom = Math.max(
       rawDimensions.viewportHeight + 100,
-      Math.round(referenceY + referenceHeight + 260)
+      Math.round(normalizedReferenceY + referenceHeight + 260)
     );
     const clipHeight = Math.max(
       Math.min(rawDimensions.viewportHeight, MAX_CAPTURE_HEIGHT),
