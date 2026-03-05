@@ -11,8 +11,18 @@ services:
       - key: MOCKUP_CONCURRENCY
         value: "1"
       - key: CAPTURE_MAX_SCROLL_PX
-        value: "2200"
+        value: "1600"
       - key: CAPTURE_MAX_HEIGHT
-        value: "3600"
+        value: "3400"
+      - key: SLOT_SCAN_LIMIT
+        value: "900"
+      - key: CAPTURE_VIEWPORT_WIDTH
+        value: "1366"
+      - key: ADTAG_NAV_TIMEOUT_MS
+        value: "10000"
+      - key: ADTAG_WAIT_MS
+        value: "1500"
+      - key: PUPPETEER_SINGLE_PROCESS
+        value: "false"
       - key: GEMINI_API_KEY
         sync: false
