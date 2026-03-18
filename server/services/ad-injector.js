@@ -128,7 +128,8 @@ async function generateMockup({
   if (adImageBuffer) {
     adCreativeBuffer = adImageBuffer;
   } else if (adTag) {
-    adCreativeBuffer = await renderAdTag(adTag, adWidth, adHeight);
+    const renderedCreative = await renderAdTag(adTag, adWidth, adHeight);
+    adCreativeBuffer = renderedCreative?.imageBuffer || null;
     if (adCreativeBuffer) {
       adTagRendered = true;
     } else {

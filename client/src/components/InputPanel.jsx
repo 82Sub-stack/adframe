@@ -20,6 +20,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
   const [adImage, setAdImage] = useState(null);
   const [adImagePreview, setAdImagePreview] = useState(null);
   const [allowHeuristicFallback, setAllowHeuristicFallback] = useState(false);
+  const [alwaysShowSlotPicker, setAlwaysShowSlotPicker] = useState(false);
   const [mockupCount, setMockupCount] = useState(2);
   const [overrideUrl, setOverrideUrl] = useState('');
   const [suggestions, setSuggestions] = useState(null);
@@ -175,7 +176,12 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
           timeout: 240000,
         });
 
-        results.push(res.data);
+        results.push({
+          ...res.data,
+          clientOptions: {
+            alwaysShowSlotPicker,
+          },
+        });
       }
 
       onResult(results);
@@ -412,6 +418,23 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
             Allow heuristic fallback when no reliable ad slot is found
             <span className="block text-text-muted mt-0.5">
               Disabled means generation fails instead of placing ads in potentially wrong spots.
+            </span>
+          </span>
+        </label>
+      </div>
+
+      <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
+        <label className="flex items-start gap-2 text-xs text-text-primary">
+          <input
+            type="checkbox"
+            checked={alwaysShowSlotPicker}
+            onChange={(e) => setAlwaysShowSlotPicker(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Always show slot picker when candidates are available
+            <span className="block text-text-muted mt-0.5">
+              Disabled means high-confidence auto-selections open directly on the generated mockup.
             </span>
           </span>
         </label>

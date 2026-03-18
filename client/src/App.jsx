@@ -38,6 +38,7 @@ export default function App() {
         <div className="flex-1 bg-surface overflow-y-auto">
           <PreviewPanel
             result={mockupResult}
+            onResultChange={setMockupResult}
             isGenerating={isGenerating}
             progressStep={progressStep}
             error={error}

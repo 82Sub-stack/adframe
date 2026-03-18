@@ -46,6 +46,24 @@ router.get('/download-mockup/:id/preview', (req, res) => {
   res.sendFile(entry.path);
 });
 
+router.get('/download-mockup/:id/annotated', (req, res) => {
+  const { id } = req.params;
+
+  if (!mockupStore || !mockupStore.has(id)) {
+    return res.status(404).json({ error: 'Mockup not found' });
+  }
+
+  const entry = mockupStore.get(id);
+  const previewPath = entry.annotatedPath || entry.path;
+  if (!previewPath || !fs.existsSync(previewPath)) {
+    return res.status(404).json({ error: 'Annotated preview not found' });
+  }
+
+  res.setHeader('Content-Type', 'image/png');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.sendFile(previewPath);
+});
+
 // Download ad tag as HTML file: /api/download-adtag/:id
 router.get('/download-adtag/:id', (req, res) => {
   const { id } = req.params;

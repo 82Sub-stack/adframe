@@ -174,6 +174,242 @@ async function resolveTopicAwareUrl(url, topic) {
   return url;
 }
 
+function getSlotConfidence(score = 0) {
+  if (score >= 82) return 'high';
+  if (score >= 68) return 'medium';
+  return 'low';
+}
+
+function normalizeSlotCandidates(slotCandidates = []) {
+  return slotCandidates.slice(0, 5).map((candidate, index) => ({
+    slotId: candidate.slotId,
+    rank: index + 1,
+    score: candidate.score,
+    type: candidate.type,
+    x: candidate.x,
+    y: candidate.y,
+    width: candidate.slotWidth,
+    height: candidate.slotHeight,
+    confidence: getSlotConfidence(candidate.score),
+  }));
+}
+
+async function generateAnnotatedPreview(baseScreenshotBuffer, slotCandidates = []) {
+  if (!baseScreenshotBuffer) return null;
+
+  const previewCandidates = normalizeSlotCandidates(slotCandidates).slice(0, 3);
+  if (previewCandidates.length === 0) {
+    return Buffer.from(baseScreenshotBuffer);
+  }
+
+  const image = sharp(baseScreenshotBuffer);
+  const metadata = await image.metadata();
+  const width = metadata.width || 1;
+  const height = metadata.height || 1;
+  const colors = ['#00C853', '#2196F3', '#FF9800'];
+
+  const overlays = previewCandidates.map((candidate, index) => {
+    const color = colors[index] || '#2196F3';
+    const left = Math.max(0, Math.min(width - 1, Math.round(candidate.x)));
+    const top = Math.max(0, Math.min(height - 1, Math.round(candidate.y)));
+    const rectWidth = Math.max(24, Math.min(width - left, Math.round(candidate.width)));
+    const rectHeight = Math.max(24, Math.min(height - top, Math.round(candidate.height)));
+    const labelWidth = 38;
+    const labelHeight = 28;
+
+    return `
+      <g>
+        <rect x="${left}" y="${top}" width="${rectWidth}" height="${rectHeight}" rx="6" ry="6"
+          fill="${color}" fill-opacity="0.22" stroke="${color}" stroke-width="3" />
+        <rect x="${left}" y="${top}" width="${labelWidth}" height="${labelHeight}" rx="0" ry="0" fill="${color}" />
+        <text x="${left + labelWidth / 2}" y="${top + 19}" text-anchor="middle"
+          font-family="Arial, sans-serif" font-size="16" font-weight="700" fill="#ffffff">${candidate.rank}</text>
+      </g>
+    `;
+  }).join('');
+
+  const svg = Buffer.from(`
+    <svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+      ${overlays}
+    </svg>
+  `);
+
+  return image
+    .composite([{ input: svg, top: 0, left: 0 }])
+    .png({ quality: 90 })
+    .toBuffer();
+}
+
+async function runGenerationJob({
+  url,
+  adSize,
+  deviceType,
+  adTag,
+  adImageBuffer,
+  allowHeuristicFallbackEnabled,
+  selectedSlotId = null,
+}) {
+  const [adWidth, adHeight] = adSize.split('x').map(Number);
+
+  return queue.run(async () => {
+    const captureResult = await captureWebsite(
+      url,
+      deviceType,
+      adWidth,
+      adHeight,
+      () => {},
+      {
+        adTag: adTag || null,
+        adImageBuffer: adImageBuffer || null,
+        slotId: selectedSlotId || null,
+      }
+    );
+
+    const slotCandidates = normalizeSlotCandidates(captureResult.slotCandidates || []);
+    const selectedCandidate = selectedSlotId
+      ? (captureResult.slotCandidates || []).find((candidate) => candidate.slotId === selectedSlotId)
+      : captureResult.detectedSlot;
+
+    if (selectedSlotId && !selectedCandidate) {
+      const err = new Error('The selected ad slot is no longer available on this page.');
+      err.code = 'INVALID_SLOT_ID';
+      throw err;
+    }
+
+    const annotatedPreview = await generateAnnotatedPreview(
+      captureResult.baseScreenshot,
+      captureResult.slotCandidates || []
+    );
+
+    if (captureResult.domInjection?.succeeded) {
+      return {
+        mockup: captureResult.screenshot,
+        annotatedPreview,
+        slotCandidates,
+        placement: {
+          x: captureResult.domInjection.x,
+          y: captureResult.domInjection.y,
+          adSize,
+          adSizeName: getAdSizeName(adSize),
+          method: selectedSlotId ? 'user-selected' : 'dom-injected',
+          slotId: captureResult.domInjection.selectedSlotId || selectedSlotId || captureResult.detectedSlot?.slotId || null,
+          adTagRendered: captureResult.preparedCreative?.adTagRendered || Boolean(adTag),
+          adTagType: captureResult.preparedCreative?.adTagType || null,
+          renderStrategy: captureResult.preparedCreative?.renderStrategy || null,
+          renderConfidence: captureResult.preparedCreative?.renderConfidence || null,
+          visuallyVerified: Boolean(captureResult.domInjection.visuallyVerified),
+          visualDiffRatio: captureResult.domInjection.visualDiffRatio ?? null,
+        },
+        consentHandled: captureResult.consentHandled,
+        finalUrl: captureResult.finalUrl || url,
+      };
+    }
+
+    const preparedCreative = captureResult.preparedCreative || {};
+    const mockupResult = await generateMockup({
+      screenshotBuffer: captureResult.screenshot,
+      dimensions: captureResult.dimensions,
+      device: deviceType,
+      adSize,
+      adTag: preparedCreative.adTag ?? (adTag || null),
+      adImageBuffer: preparedCreative.adImageBuffer ?? (adImageBuffer || null),
+      detectedSlot: selectedCandidate || captureResult.detectedSlot,
+      allowHeuristicFallback: allowHeuristicFallbackEnabled,
+    });
+
+    if (captureResult.domInjection?.reason && captureResult.domInjection.reason !== 'not-attempted') {
+      mockupResult.placement.domInjectionFallbackReason = captureResult.domInjection.reason;
+    }
+    if (preparedCreative.adTagRendered) {
+      mockupResult.placement.adTagRendered = true;
+    }
+
+    mockupResult.placement.slotId = selectedSlotId || selectedCandidate?.slotId || captureResult.detectedSlot?.slotId || null;
+    mockupResult.placement.adTagType = preparedCreative.adTagType || null;
+    mockupResult.placement.renderStrategy = preparedCreative.renderStrategy || null;
+    mockupResult.placement.renderConfidence = preparedCreative.renderConfidence || null;
+    mockupResult.placement.method = selectedSlotId ? 'user-selected' : mockupResult.placement.method;
+
+    return {
+      ...mockupResult,
+      annotatedPreview,
+      slotCandidates,
+      consentHandled: captureResult.consentHandled,
+      finalUrl: captureResult.finalUrl || url,
+    };
+  });
+}
+
+function pruneMockupStore() {
+  if (mockupStore.size <= 100) {
+    return;
+  }
+
+  const entries = [...mockupStore.entries()].filter(([key]) => !String(key).startsWith('adtag-'));
+  const toDelete = entries.slice(0, Math.max(0, entries.length - 50));
+
+  toDelete.forEach(([key, value]) => {
+    if (value.path && fs.existsSync(value.path)) {
+      fs.unlinkSync(value.path);
+    }
+    if (value.annotatedPath && fs.existsSync(value.annotatedPath)) {
+      fs.unlinkSync(value.annotatedPath);
+    }
+    mockupStore.delete(key);
+    mockupStore.delete(`adtag-${key}`);
+  });
+}
+
+function storeMockupResult({
+  mockupBuffer,
+  annotatedPreviewBuffer,
+  metadata,
+  request,
+  adTag,
+}) {
+  const mockupId = uuidv4();
+  const mockupPath = path.join(outputDir, `${mockupId}.png`);
+  fs.writeFileSync(mockupPath, mockupBuffer);
+
+  let annotatedPath = null;
+  if (annotatedPreviewBuffer) {
+    annotatedPath = path.join(outputDir, `${mockupId}-annotated.png`);
+    fs.writeFileSync(annotatedPath, annotatedPreviewBuffer);
+  }
+
+  mockupStore.set(mockupId, {
+    path: mockupPath,
+    annotatedPath,
+    metadata,
+    request,
+  });
+
+  if (adTag) {
+    mockupStore.set(`adtag-${mockupId}`, { adTag });
+  }
+
+  pruneMockupStore();
+  return mockupId;
+}
+
+function buildMockupResponse(mockupId, metadata) {
+  return {
+    mockupId,
+    mockupImageUrl: `/api/download-mockup/${mockupId}`,
+    annotatedPreviewUrl: `/api/download-mockup/${mockupId}/annotated`,
+    adTagDownloadUrl: metadata.hasAdTag ? `/api/download-adtag/${mockupId}` : null,
+    slotCandidates: metadata.slotCandidates || [],
+    metadata: {
+      websiteUrl: metadata.websiteUrl,
+      adSize: metadata.adSize,
+      adSizeName: metadata.adSizeName,
+      device: metadata.device,
+      placement: metadata.placement,
+      consentHandled: metadata.consentHandled,
+    },
+  };
+}
+
 router.post('/', upload.single('adImage'), async (req, res) => {
   try {
     const { websiteUrl, topic, adSize, device, adTag, allowHeuristicFallback } = req.body;
@@ -246,117 +482,47 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       });
     }
 
-    // Parse ad dimensions for slot detection
-    const [adWidth, adHeight] = adSize.split('x').map(Number);
     let finalWebsiteUrl = url;
-
-    // Generate mockup via queue
-    const result = await queue.run(async () => {
-      // Step 1: Capture website screenshot (also detects ad slot positions)
-      const captureResult = await captureWebsite(
-        url,
-        deviceType,
-        adWidth,
-        adHeight,
-        () => {},
-        {
-          adTag: adTag || null,
-          adImageBuffer: adImage ? adImage.buffer : null,
-        }
-      );
-
-      // Preferred path: inject creative into detected slot in live DOM and screenshot the page.
-      if (captureResult.domInjection?.succeeded) {
-        const placement = {
-          x: captureResult.domInjection.x,
-          y: captureResult.domInjection.y,
-          adSize,
-          adSizeName: getAdSizeName(adSize),
-          method: 'dom-injected',
-          adTagRendered: Boolean(adTag),
-        };
-
-        return {
-          mockup: captureResult.screenshot,
-          placement,
-          consentHandled: captureResult.consentHandled,
-          finalUrl: captureResult.finalUrl || url,
-        };
-      }
-
-      // Fallback path: composite ad onto screenshot when direct DOM injection fails.
-      const mockupResult = await generateMockup({
-        screenshotBuffer: captureResult.screenshot,
-        dimensions: captureResult.dimensions,
-        device: deviceType,
-        adSize,
-        adTag: adTag || null,
-        adImageBuffer: adImage ? adImage.buffer : null,
-        detectedSlot: captureResult.detectedSlot,
-        allowHeuristicFallback: allowHeuristicFallbackEnabled,
-      });
-
-      if (captureResult.domInjection?.reason && captureResult.domInjection.reason !== 'not-attempted') {
-        mockupResult.placement.domInjectionFallbackReason = captureResult.domInjection.reason;
-      }
-
-      return {
-        ...mockupResult,
-        consentHandled: captureResult.consentHandled,
-        finalUrl: captureResult.finalUrl || url,
-      };
+    const result = await runGenerationJob({
+      url,
+      adSize,
+      deviceType,
+      adTag,
+      adImageBuffer: adImage ? adImage.buffer : null,
+      allowHeuristicFallbackEnabled,
     });
 
     finalWebsiteUrl = result.finalUrl || finalWebsiteUrl;
+    const storedMetadata = {
+      websiteUrl: finalWebsiteUrl,
+      adSize,
+      adSizeName: result.placement.adSizeName,
+      device: deviceType,
+      placement: result.placement,
+      consentHandled: result.consentHandled,
+      slotCandidates: result.slotCandidates || [],
+      hasAdTag: Boolean(adTag),
+      createdAt: new Date().toISOString(),
+    };
+    const requestContext = {
+      websiteUrl: finalWebsiteUrl,
+      topic: topic || '',
+      adSize,
+      device: deviceType,
+      allowHeuristicFallback: allowHeuristicFallbackEnabled,
+      adTag: adTag || null,
+      adImageBuffer: adImage ? adImage.buffer : null,
+    };
 
-    // Store the mockup
-    const mockupId = uuidv4();
-    const mockupPath = path.join(outputDir, `${mockupId}.png`);
-    fs.writeFileSync(mockupPath, result.mockup);
-
-    mockupStore.set(mockupId, {
-      path: mockupPath,
-      metadata: {
-        websiteUrl: finalWebsiteUrl,
-        adSize,
-        device: deviceType,
-        placement: result.placement,
-        consentHandled: result.consentHandled,
-        createdAt: new Date().toISOString(),
-      },
+    const mockupId = storeMockupResult({
+      mockupBuffer: result.mockup,
+      annotatedPreviewBuffer: result.annotatedPreview,
+      metadata: storedMetadata,
+      request: requestContext,
+      adTag: adTag || null,
     });
 
-    // Also store ad tag if provided
-    if (adTag) {
-      const adTagId = `adtag-${mockupId}`;
-      mockupStore.set(adTagId, { adTag });
-    }
-
-    // Clean up old mockups (keep last 50)
-    if (mockupStore.size > 100) {
-      const entries = [...mockupStore.entries()];
-      const toDelete = entries.slice(0, entries.length - 50);
-      toDelete.forEach(([key, value]) => {
-        if (value.path && fs.existsSync(value.path)) {
-          fs.unlinkSync(value.path);
-        }
-        mockupStore.delete(key);
-      });
-    }
-
-    res.json({
-      mockupId,
-      mockupImageUrl: `/api/download-mockup/${mockupId}`,
-      adTagDownloadUrl: adTag ? `/api/download-adtag/${mockupId}` : null,
-      metadata: {
-        websiteUrl: finalWebsiteUrl,
-        adSize,
-        adSizeName: result.placement.adSizeName,
-        device: deviceType,
-        placement: result.placement,
-        consentHandled: result.consentHandled,
-      },
-    });
+    res.json(buildMockupResponse(mockupId, storedMetadata));
   } catch (err) {
     console.error('Mockup generation error:', err);
     const message = err?.message || '';
@@ -379,6 +545,12 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       });
     }
 
+    if (err.code === 'INVALID_SLOT_ID') {
+      return res.status(422).json({
+        error: err.message,
+      });
+    }
+
     if (
       /Target closed|Session closed|browser has disconnected|ENOMEM|heap out of memory|Cannot find context/i.test(message)
     ) {
@@ -389,6 +561,70 @@ router.post('/', upload.single('adImage'), async (req, res) => {
 
     res.status(500).json({
       error: 'Failed to generate mockup. Please try again.',
+      details: process.env.NODE_ENV !== 'production' ? err.message : undefined,
+    });
+  }
+});
+
+router.post('/:id/inject', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { slotId } = req.body || {};
+
+    if (!slotId) {
+      return res.status(400).json({ error: 'slotId is required' });
+    }
+
+    if (!mockupStore.has(id)) {
+      return res.status(404).json({ error: 'Original mockup not found' });
+    }
+
+    const existing = mockupStore.get(id);
+    const request = existing?.request;
+    if (!request) {
+      return res.status(404).json({ error: 'Original generation context is no longer available' });
+    }
+
+    const result = await runGenerationJob({
+      url: request.websiteUrl,
+      adSize: request.adSize,
+      deviceType: request.device,
+      adTag: request.adTag,
+      adImageBuffer: request.adImageBuffer || null,
+      allowHeuristicFallbackEnabled: parseBoolean(request.allowHeuristicFallback, false),
+      selectedSlotId: slotId,
+    });
+
+    const storedMetadata = {
+      websiteUrl: result.finalUrl || request.websiteUrl,
+      adSize: request.adSize,
+      adSizeName: result.placement.adSizeName,
+      device: request.device,
+      placement: result.placement,
+      consentHandled: result.consentHandled,
+      slotCandidates: result.slotCandidates || existing.metadata?.slotCandidates || [],
+      hasAdTag: Boolean(request.adTag),
+      createdAt: new Date().toISOString(),
+    };
+
+    const mockupId = storeMockupResult({
+      mockupBuffer: result.mockup,
+      annotatedPreviewBuffer: result.annotatedPreview,
+      metadata: storedMetadata,
+      request,
+      adTag: request.adTag || null,
+    });
+
+    res.json(buildMockupResponse(mockupId, storedMetadata));
+  } catch (err) {
+    console.error('Targeted mockup generation error:', err);
+
+    if (err.code === 'INVALID_SLOT_ID' || err.code === 'NO_RELIABLE_SLOT') {
+      return res.status(422).json({ error: err.message });
+    }
+
+    res.status(500).json({
+      error: 'Failed to generate mockup for the selected slot. Please try again.',
       details: process.env.NODE_ENV !== 'production' ? err.message : undefined,
     });
   }
