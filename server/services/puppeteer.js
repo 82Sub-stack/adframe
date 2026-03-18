@@ -51,6 +51,13 @@ function isWideFormat(width, height) {
   return width / Math.max(1, height) >= 1.7;
 }
 
+function getEffectiveCaptureHeightLimit(adWidth, adHeight) {
+  if (IS_PRODUCTION && isTallFormat(adWidth, adHeight)) {
+    return Math.min(MAX_CAPTURE_HEIGHT, 2600);
+  }
+  return MAX_CAPTURE_HEIGHT;
+}
+
 function getFormatAwareSlotThresholds(adWidth, adHeight, device) {
   if (isTallFormat(adWidth, adHeight)) {
     return {
@@ -663,18 +670,14 @@ async function getSlotVisualState(page, slotId, maxCaptureHeight) {
   }, slotId, maxCaptureHeight);
 }
 
-function buildPageScreenshotOptions(rawDimensions, viewport, referenceY, referenceHeight) {
-  const normalizedReferenceY = referenceY > rawDimensions.viewportHeight * 3
-    ? Math.floor(rawDimensions.viewportHeight * 1.2)
-    : referenceY;
-
+function buildPageScreenshotOptions(rawDimensions, viewport, referenceY, referenceHeight, maxCaptureHeight = MAX_CAPTURE_HEIGHT) {
   const desiredBottom = Math.max(
     rawDimensions.viewportHeight + 100,
-    Math.round(normalizedReferenceY + referenceHeight + 260)
+    Math.round(referenceY + referenceHeight + 260)
   );
   const clipHeight = Math.max(
-    Math.min(rawDimensions.viewportHeight, MAX_CAPTURE_HEIGHT),
-    Math.min(rawDimensions.height, Math.min(MAX_CAPTURE_HEIGHT, desiredBottom))
+    Math.min(rawDimensions.viewportHeight, maxCaptureHeight),
+    Math.min(rawDimensions.height, Math.min(maxCaptureHeight, desiredBottom))
   );
 
   return {
@@ -789,7 +792,7 @@ async function navigateWithFallbacks(page, initialUrl) {
 async function injectCreativeIntoDetectedSlot(
   page,
   detectedSlot,
-  { adTag = null, adImageBuffer = null, adWidth = 300, adHeight = 250, device = 'desktop', slotCandidates = null } = {}
+  { adTag = null, adImageBuffer = null, adWidth = 300, adHeight = 250, device = 'desktop', slotCandidates = null, captureHeightLimit = MAX_CAPTURE_HEIGHT } = {}
 ) {
   const mode = adImageBuffer ? 'image' : adTag ? 'adtag' : null;
   if (!mode) {
@@ -809,8 +812,9 @@ async function injectCreativeIntoDetectedSlot(
     .filter((c) => c.isAd || c.type === 'iframe' || c.type === 'gpt')
     .filter((c) => (c.slotWidth || 0) >= Math.max(120, adWidth * 0.55))
     .filter((c) => (c.slotHeight || 0) >= Math.max(60, adHeight * 0.5))
+    .filter((c) => (c.y || 0) + Math.max(40, Math.min(c.slotHeight || adHeight, adHeight)) <= captureHeightLimit - 40)
     .filter((c) => isFormatCompatibleSlot(c, adWidth, adHeight, device))
-    .slice(0, 5);
+    .slice(0, IS_PRODUCTION ? 3 : 5);
 
   if (eligible.length === 0) {
     return { succeeded: false, reason: 'no-eligible-slot' };
@@ -826,7 +830,7 @@ async function injectCreativeIntoDetectedSlot(
 
   for (let index = 0; index < eligible.length; index++) {
     const candidate = eligible[index];
-    const visualState = await getSlotVisualState(page, candidate.slotId, MAX_CAPTURE_HEIGHT);
+    const visualState = await getSlotVisualState(page, candidate.slotId, captureHeightLimit);
     if (!visualState.visible) {
       continue;
     }
@@ -967,7 +971,7 @@ async function injectCreativeIntoDetectedSlot(
 
     await new Promise((r) => setTimeout(r, mode === 'adtag' ? 1200 : 350));
 
-    const postVisualState = await getSlotVisualState(page, candidate.slotId, MAX_CAPTURE_HEIGHT);
+    const postVisualState = await getSlotVisualState(page, candidate.slotId, captureHeightLimit);
     if (!postVisualState.visible) {
       continue;
     }
@@ -1025,6 +1029,7 @@ async function captureWebsite(
   try {
     const viewport = device === 'mobile' ? MOBILE_VIEWPORT : DESKTOP_VIEWPORT;
     const ua = device === 'mobile' ? MOBILE_UA : DESKTOP_UA;
+    const captureHeightLimit = getEffectiveCaptureHeightLimit(adWidth, adHeight);
 
     await page.setViewport(viewport);
     await page.setUserAgent(ua);
@@ -1101,11 +1106,6 @@ async function captureWebsite(
       height: document.documentElement.scrollHeight,
       viewportHeight: window.innerHeight,
     }));
-    const baseReferenceY = detectedSlot?.y ?? Math.floor(rawDimensions.viewportHeight * 0.6);
-    const baseReferenceHeight = detectedSlot?.slotHeight ?? adHeight;
-    const baseScreenshotOptions = buildPageScreenshotOptions(rawDimensions, viewport, baseReferenceY, baseReferenceHeight);
-    const baseScreenshot = await page.screenshot(baseScreenshotOptions);
-
     let domInjection = { succeeded: false, reason: 'not-attempted' };
     let preparedCreative = injectionOptions
       ? {
@@ -1161,6 +1161,7 @@ async function captureWebsite(
         adHeight,
         device,
         slotCandidates,
+        captureHeightLimit,
       });
     }
 
@@ -1173,7 +1174,13 @@ async function captureWebsite(
       ? domInjection.slotHeight
       : detectedSlot?.slotHeight ?? adHeight;
 
-    const screenshotOptions = buildPageScreenshotOptions(rawDimensions, viewport, referenceY, referenceHeight);
+    const screenshotOptions = buildPageScreenshotOptions(
+      rawDimensions,
+      viewport,
+      referenceY,
+      referenceHeight,
+      captureHeightLimit
+    );
     const screenshot = await page.screenshot(screenshotOptions);
 
     const dimensions = {
@@ -1185,7 +1192,6 @@ async function captureWebsite(
     };
 
     return {
-      baseScreenshot: Buffer.from(baseScreenshot),
       screenshot: Buffer.from(screenshot),
       dimensions,
       consentHandled,

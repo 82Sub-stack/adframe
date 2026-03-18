@@ -276,15 +276,11 @@ async function runGenerationJob({
       throw err;
     }
 
-    const annotatedPreview = await generateAnnotatedPreview(
-      captureResult.baseScreenshot,
-      captureResult.slotCandidates || []
-    );
-
     if (captureResult.domInjection?.succeeded) {
+      const mockup = captureResult.screenshot;
       return {
-        mockup: captureResult.screenshot,
-        annotatedPreview,
+        mockup,
+        annotatedPreview: await generateAnnotatedPreview(mockup, captureResult.slotCandidates || []),
         slotCandidates,
         placement: {
           x: captureResult.domInjection.x,
@@ -332,7 +328,7 @@ async function runGenerationJob({
 
     return {
       ...mockupResult,
-      annotatedPreview,
+      annotatedPreview: await generateAnnotatedPreview(mockupResult.mockup, captureResult.slotCandidates || []),
       slotCandidates,
       consentHandled: captureResult.consentHandled,
       finalUrl: captureResult.finalUrl || url,
