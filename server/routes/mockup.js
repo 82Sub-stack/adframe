@@ -6,12 +6,31 @@ const sharp = require('sharp');
 const path = require('path');
 const fs = require('fs');
 const { captureWebsite } = require('../services/puppeteer');
-const { generateMockup, getAdSizeName } = require('../services/ad-injector');
+const { generateMockup } = require('../services/ad-injector');
 const { isBlockedDomain } = require('../services/gemini');
 const queue = require('../utils/queue');
 
-// Configure multer for image uploads
-const storage = multer.memoryStorage();
+// Store generated mockups in memory (use disk/S3 in production)
+const mockupStore = new Map();
+
+// Ensure output directory exists
+const outputDir = path.join(__dirname, '..', 'output');
+const uploadDir = path.join(__dirname, '..', 'tmp', 'uploads');
+if (!fs.existsSync(outputDir)) {
+  fs.mkdirSync(outputDir, { recursive: true });
+}
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+// Configure multer for disk-backed uploads to avoid holding creatives in RAM.
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const extension = path.extname(file.originalname || '').toLowerCase() || '.bin';
+    cb(null, `${uuidv4()}${extension}`);
+  },
+});
 const upload = multer({
   storage,
   limits: { fileSize: 10 * 1024 * 1024 }, // 10MB max
@@ -25,15 +44,6 @@ const upload = multer({
   },
 });
 
-// Store generated mockups in memory (use disk/S3 in production)
-const mockupStore = new Map();
-
-// Ensure output directory exists
-const outputDir = path.join(__dirname, '..', 'output');
-if (!fs.existsSync(outputDir)) {
-  fs.mkdirSync(outputDir, { recursive: true });
-}
-
 const TOPIC_PATH_HINTS = {
   sports: ['sport', 'sports', 'soccer', 'football', 'fussball'],
   soccer: ['soccer', 'football', 'fussball', 'sport'],
@@ -45,6 +55,11 @@ const TOPIC_PATH_HINTS = {
   cooking: ['cooking', 'rezepte', 'food', 'recipe', 'essen'],
   lifestyle: ['lifestyle', 'leben', 'style'],
 };
+
+const MOCKUP_JOB_TIMEOUT_MS = Number.parseInt(
+  process.env.MOCKUP_JOB_TIMEOUT_MS || '',
+  10
+) || (process.env.NODE_ENV === 'production' ? 70000 : 120000);
 
 function parseBoolean(value, defaultValue = false) {
   if (typeof value === 'boolean') return value;
@@ -59,6 +74,24 @@ function parseBoolean(value, defaultValue = false) {
 
 function unique(items) {
   return [...new Set(items.filter(Boolean))];
+}
+
+async function withTimeout(promise, timeoutMs, errorMessage) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const err = new Error(errorMessage);
+          err.code = 'MOCKUP_TIMEOUT';
+          reject(err);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function getTopicKeywords(topic) {
@@ -407,6 +440,8 @@ function buildMockupResponse(mockupId, metadata) {
 }
 
 router.post('/', upload.single('adImage'), async (req, res) => {
+  const uploadedImagePath = req.file?.path || null;
+
   try {
     const { websiteUrl, topic, adSize, device, adTag, allowHeuristicFallback } = req.body;
     const adImage = req.file;
@@ -445,7 +480,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     if (adImage) {
       const [expectedWidth, expectedHeight] = adSize.split('x').map(Number);
       try {
-        const meta = await sharp(adImage.buffer).metadata();
+        const meta = await sharp(adImage.path).metadata();
         // Allow some tolerance (within 2px)
         if (Math.abs(meta.width - expectedWidth) > 2 || Math.abs(meta.height - expectedHeight) > 2) {
           return res.status(400).json({
@@ -523,9 +558,9 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     console.error('Mockup generation error:', err);
     const message = err?.message || '';
 
-    if (message.includes('timeout') || message.includes('Timeout')) {
+    if (err.code === 'MOCKUP_TIMEOUT' || message.includes('timeout') || message.includes('Timeout')) {
       return res.status(504).json({
-        error: 'Page load timed out. Try a different website or check the URL.',
+        error: 'Mockup generation timed out. Try a different website or retry in a moment.',
       });
     }
 
@@ -559,6 +594,14 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       error: 'Failed to generate mockup. Please try again.',
       details: process.env.NODE_ENV !== 'production' ? err.message : undefined,
     });
+  } finally {
+    if (uploadedImagePath && fs.existsSync(uploadedImagePath)) {
+      try {
+        fs.unlinkSync(uploadedImagePath);
+      } catch (cleanupErr) {
+        console.warn('Failed to remove uploaded creative:', cleanupErr.message);
+      }
+    }
   }
 });
 

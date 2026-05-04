@@ -41,10 +41,11 @@ function isBlockedDomain(url) {
  * Suggest publisher websites based on topic and country.
  * Falls back to hardcoded list if Gemini API fails.
  */
-async function suggestWebsites(topic, country) {
+async function suggestWebsites(topic, country, options = {}) {
+  const limit = Math.max(3, Math.min(Number.parseInt(options.limit, 10) || 12, 20));
   const blockedList = BLOCKED_DOMAINS.join(', ');
 
-  const prompt = `You are a digital media planning assistant. Given a topic/vertical and a target country, suggest exactly 3 real, active publisher websites that:
+  const prompt = `You are a digital media planning assistant. Given a topic/vertical and a target country, suggest exactly ${limit} real, active publisher websites that:
 1. Are major, well-known publishers in that country for the given topic
 2. Have standard IAB display ad placements
 3. Are freely accessible (no hard paywall blocking all content)
@@ -74,7 +75,7 @@ Respond ONLY in this exact JSON format, no other text:
       model: 'gemini-2.0-flash',
       generationConfig: {
         temperature: 0.2,
-        maxOutputTokens: 1024,
+        maxOutputTokens: 4096,
       },
     });
 
@@ -97,14 +98,14 @@ Respond ONLY in this exact JSON format, no other text:
         s => s.url && s.name && s.reason && !isBlockedDomain(s.url)
       );
       if (valid.length > 0) {
-        return valid.slice(0, 3);
+        return valid.slice(0, limit);
       }
     }
 
     throw new Error('Invalid response structure from Gemini');
   } catch (err) {
     console.error('Gemini API failed, using fallback:', err.message);
-    return getFallbackPublishers(topic, country);
+    return getFallbackPublishers(topic, country, limit);
   }
 }
 

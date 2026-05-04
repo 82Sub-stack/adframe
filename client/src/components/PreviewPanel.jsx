@@ -34,6 +34,30 @@ function getPlacementMethodInfo(method) {
   }
 }
 
+function getPlacementConfidenceInfo(confidence) {
+  switch (confidence) {
+    case 'high':
+      return { label: 'High confidence', className: 'bg-emerald-100 text-emerald-700' };
+    case 'medium':
+      return { label: 'Medium confidence', className: 'bg-yellow-100 text-yellow-800' };
+    case 'low':
+      return { label: 'Low confidence', className: 'bg-red-100 text-red-700' };
+    default:
+      return null;
+  }
+}
+
+function getTabLabel(item, idx) {
+  if (item?.failed) return `Failed ${idx + 1}`;
+  try {
+    const url = item?.metadata?.websiteUrl || item?.websiteUrl;
+    if (url) return new URL(url).hostname.replace(/^www\./, '');
+  } catch {
+    // Fall back to numbered labels.
+  }
+  return `Site ${idx + 1}`;
+}
+
 function shouldShowSlotPicker(mockup) {
   const slotCandidates = mockup?.slotCandidates || [];
   const alwaysShow = mockup?.clientOptions?.alwaysShowSlotPicker;
@@ -98,8 +122,8 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
 
   const safeIndex = Math.max(0, Math.min(activeIndex, Math.max(mockups.length - 1, 0)));
   const current = mockups[safeIndex];
-  const slotCandidates = current?.slotCandidates || [];
-  const pickerVisible = shouldShowSlotPicker(current);
+  const slotCandidates = current?.failed ? [] : current?.slotCandidates || [];
+  const pickerVisible = current?.failed ? false : shouldShowSlotPicker(current);
 
   useEffect(() => {
     setSelectedSlotId(current?.metadata?.placement?.slotId || slotCandidates[0]?.slotId || null);
@@ -107,18 +131,45 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
     setApplyError(null);
   }, [current?.mockupId, current?.metadata?.placement?.slotId, slotCandidates]);
 
-  const currentPreviewUrl = current ? `${current.mockupImageUrl}/preview` : null;
+  const currentPreviewUrl = current && !current.failed ? `${current.mockupImageUrl}/preview` : null;
   const annotatedPreviewUrl = current?.annotatedPreviewUrl || currentPreviewUrl;
   const previewUrl = pickerVisible && showAnnotated ? annotatedPreviewUrl : currentPreviewUrl;
-  const methodInfo = current ? getPlacementMethodInfo(current.metadata?.placement?.method) : null;
+  const methodInfo = current && !current.failed ? getPlacementMethodInfo(current.metadata?.placement?.method) : null;
+  const confidenceInfo = current && !current.failed ? getPlacementConfidenceInfo(current.metadata?.placement?.confidence) : null;
 
   const selectedSlot = useMemo(
     () => slotCandidates.find((candidate) => candidate.slotId === selectedSlotId) || slotCandidates[0] || null,
     [slotCandidates, selectedSlotId]
   );
 
+  const renderTabs = () => mockups.length > 1 && (
+    <div className="mb-4">
+      <div className="text-xs text-text-muted mb-2">Generated Mockups ({mockups.filter((item) => !item.failed).length})</div>
+      <div className="flex gap-2 flex-wrap">
+        {mockups.map((item, idx) => (
+          <button
+            key={item.mockupId || item.websiteUrl || idx}
+            type="button"
+            onClick={() => setActiveIndex(idx)}
+            className={`px-3 py-1.5 rounded-lg border text-xs max-w-[180px] truncate ${
+              safeIndex === idx
+                ? item.failed
+                  ? 'border-red-300 bg-red-50 text-red-700'
+                  : 'border-accent bg-accent/10 text-accent'
+                : item.failed
+                ? 'border-red-100 text-red-600 hover:bg-red-50'
+                : 'border-gray-200 text-text-primary hover:bg-gray-50'
+            }`}
+          >
+            {getTabLabel(item, idx)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
   const handleApplyPlacement = async () => {
-    if (!current || !selectedSlotId) return;
+    if (!current || current.failed || !selectedSlotId) return;
 
     if (selectedSlotId === current.metadata?.placement?.slotId) {
       setShowAnnotated(false);
@@ -177,53 +228,64 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
           </div>
           <h3 className="text-lg font-semibold text-text-primary mb-2">No Mockup Yet</h3>
           <p className="text-sm text-text-muted leading-relaxed">
-            Enter a topic, choose one or two websites, upload your ad creative, and generate mockups to see them here.
+            Enter a topic, choose ranked websites, upload your ad creative, and generate mockups to see them here.
           </p>
         </div>
       </div>
     );
   }
 
-  const isMobile = current.metadata.device === 'mobile';
+  if (current.failed) {
+    return (
+      <div className="p-6">
+        {renderTabs()}
+        <div className="flex flex-col items-center justify-center min-h-[60vh] px-8">
+          <div className="w-full max-w-md text-center">
+            <div className="w-14 h-14 rounded-full bg-red-100 flex items-center justify-center mx-auto mb-4">
+              <AlertTriangle size={24} className="text-red-500" />
+            </div>
+            <h3 className="text-lg font-semibold text-text-primary mb-2">Candidate Failed</h3>
+            <p className="text-sm text-text-muted leading-relaxed">{current.error}</p>
+            {current.websiteUrl && (
+              <div className="flex items-center justify-center gap-1.5 mt-3 text-xs text-text-muted">
+                <ExternalLink size={11} />
+                <a
+                  href={current.websiteUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-accent transition-colors truncate"
+                >
+                  {current.websiteUrl}
+                </a>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const { mockupImageUrl, adTagDownloadUrl, metadata } = current;
+  const isMobile = metadata.device === 'mobile';
 
   return (
     <div className="p-6">
-      {mockups.length > 1 && (
-        <div className="mb-4">
-          <div className="text-xs text-text-muted mb-2">Generated Mockups ({mockups.length})</div>
-          <div className="flex gap-2 flex-wrap">
-            {mockups.map((item, idx) => (
-              <button
-                key={item.mockupId || idx}
-                type="button"
-                onClick={() => setActiveIndex(idx)}
-                className={`px-3 py-1.5 rounded-lg border text-xs ${
-                  safeIndex === idx
-                    ? 'border-accent bg-accent/10 text-accent'
-                    : 'border-gray-200 text-text-primary hover:bg-gray-50'
-                }`}
-              >
-                Site {idx + 1}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
+      {renderTabs()}
 
       <div className="flex items-start justify-between mb-5 gap-4">
         <div>
           <h2 className="text-lg font-bold text-text-primary">Mockup Preview</h2>
           <div className="flex items-center gap-3 mt-1.5 flex-wrap">
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-navy text-white text-xs font-medium">
-              {current.metadata.adSizeName}
+              {metadata.adSizeName}
             </span>
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-200 text-text-primary text-xs">
-              {current.metadata.adSize}
+              {metadata.adSize}
             </span>
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-200 text-text-primary text-xs capitalize">
-              {current.metadata.device}
+              {metadata.device}
             </span>
-            {current.metadata.consentHandled && (
+            {metadata.consentHandled && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-100 text-green-700 text-xs">
                 Consent handled
               </span>
@@ -231,37 +293,42 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
             <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${methodInfo.className}`}>
               {methodInfo.label}
             </span>
-            {current.metadata.placement?.renderConfidence && (
+            {confidenceInfo && (
+              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${confidenceInfo.className}`}>
+                {confidenceInfo.label}
+              </span>
+            )}
+            {metadata.placement?.renderConfidence && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-200 text-text-primary text-xs capitalize">
-                Render {current.metadata.placement.renderConfidence}
+                Render {metadata.placement.renderConfidence}
               </span>
             )}
           </div>
           <div className="flex items-center gap-1.5 mt-2 text-xs text-text-muted">
             <ExternalLink size={11} />
             <a
-              href={current.metadata.websiteUrl}
+              href={metadata.websiteUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="hover:text-accent transition-colors"
             >
-              {current.metadata.websiteUrl}
+              {metadata.websiteUrl}
             </a>
           </div>
         </div>
 
         <div className="flex gap-2 shrink-0">
           <a
-            href={current.mockupImageUrl}
+            href={mockupImageUrl}
             download
             className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-accent text-white text-sm font-medium hover:bg-accent-hover transition-colors"
           >
             <Download size={15} />
             Download PNG
           </a>
-          {current.adTagDownloadUrl && (
+          {adTagDownloadUrl && (
             <a
-              href={current.adTagDownloadUrl}
+              href={adTagDownloadUrl}
               download
               className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-gray-300 text-text-primary text-sm font-medium hover:bg-gray-50 transition-colors"
             >
@@ -311,7 +378,7 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
         {renderPreviewFrame({
           isMobile,
           url: previewUrl,
-          websiteUrl: current.metadata.websiteUrl,
+          websiteUrl: metadata.websiteUrl,
           alt: pickerVisible && showAnnotated ? 'Annotated ad slot preview' : 'Ad placement mockup',
         })}
       </div>
@@ -331,7 +398,7 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
               disabled={isApplying || !selectedSlot}
               className="px-3 py-2 rounded-lg bg-accent text-white text-sm font-medium hover:bg-accent-hover transition-colors disabled:opacity-50"
             >
-              {isApplying ? 'Applying...' : selectedSlotId === current.metadata.placement?.slotId ? 'Use Current Placement' : 'Apply Selected Slot'}
+              {isApplying ? 'Applying...' : selectedSlotId === metadata.placement?.slotId ? 'Use Current Placement' : 'Apply Selected Slot'}
             </button>
           </div>
 
@@ -359,7 +426,7 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
                       </div>
                     </div>
                     <div className={`text-xs font-semibold ${isSelected ? 'text-accent' : 'text-text-muted'}`}>
-                      {candidate.slotId === current.metadata.placement?.slotId ? 'Current' : `#${candidate.rank}`}
+                      {candidate.slotId === metadata.placement?.slotId ? 'Current' : `#${candidate.rank}`}
                     </div>
                   </div>
                 </button>
@@ -383,13 +450,19 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
 
       <div className="mt-4 p-3 rounded-lg bg-white border border-gray-200 text-xs text-text-muted">
         <span className="font-medium text-text-primary">Placement:</span>{' '}
-        {current.metadata.placement.adSizeName} ({current.metadata.adSize}) at position ({current.metadata.placement.x}, {current.metadata.placement.y}) via {methodInfo.label}
-        {current.metadata.placement.slotId && <span> · Slot {current.metadata.placement.slotId}</span>}
-        {current.metadata.placement.domInjectionFallbackReason && (
-          <span> · DOM fallback reason: {current.metadata.placement.domInjectionFallbackReason}</span>
+        {metadata.placement.adSizeName} ({metadata.adSize}) at position ({metadata.placement.x}, {metadata.placement.y}) via {methodInfo.label}
+        {metadata.placement.slotId && <span> · Slot {metadata.placement.slotId}</span>}
+        {metadata.placement.detectionScore && (
+          <span> · score {metadata.placement.detectionScore}</span>
         )}
-        {current.metadata.placement.visualDiffRatio != null && (
-          <span> · Visual diff {current.metadata.placement.visualDiffRatio}</span>
+        {Array.isArray(metadata.placement.detectionReasons) && metadata.placement.detectionReasons.length > 0 && (
+          <span> · signals: {metadata.placement.detectionReasons.join(', ')}</span>
+        )}
+        {metadata.placement.domInjectionFallbackReason && (
+          <span> · DOM fallback reason: {metadata.placement.domInjectionFallbackReason}</span>
+        )}
+        {metadata.placement.visualDiffRatio != null && (
+          <span> · Visual diff {metadata.placement.visualDiffRatio}</span>
         )}
       </div>
     </div>

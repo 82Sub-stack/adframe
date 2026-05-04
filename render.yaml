@@ -22,6 +22,12 @@ services:
         value: "10000"
       - key: ADTAG_WAIT_MS
         value: "1500"
+      - key: BROWSER_RECYCLE_EVERY
+        value: "25"
+      - key: SUGGESTION_PREFLIGHT_TIMEOUT_MS
+        value: "4500"
+      - key: SUGGESTION_PREFLIGHT_CONCURRENCY
+        value: "4"
       - key: PUPPETEER_SINGLE_PROCESS
         value: "false"
       - key: GEMINI_API_KEY

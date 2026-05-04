@@ -10,6 +10,30 @@ const COUNTRIES = [
   'France', 'Italy', 'Spain', 'Netherlands', 'Poland',
 ];
 
+const PROGRESS_STEPS = [
+  'Loading page...',
+  'Handling consent banners...',
+  'Scrolling page...',
+  'Detecting ad positions...',
+  'Taking screenshot...',
+  'Generating mockup...',
+];
+
+const SUGGESTION_LIMIT = 12;
+const MAX_SELECTED_URLS = 5;
+const MOCKUP_COUNT_OPTIONS = [1, 2, 3, 5];
+
+function getSuggestionScore(site) {
+  return site?.preflight?.score ?? 0;
+}
+
+function getRankedViableUrls(suggestions = []) {
+  return [...suggestions]
+    .filter((site) => site?.url && site.preflight?.status !== 'failed')
+    .sort((a, b) => getSuggestionScore(b) - getSuggestionScore(a))
+    .map((site) => site.url);
+}
+
 export default function InputPanel({ onResult, onGenerating, onProgress, onError }) {
   const [topic, setTopic] = useState('');
   const [country, setCountry] = useState('');
@@ -30,6 +54,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const fileInputRef = useRef(null);
+  const progressTimerRef = useRef(null);
 
   const handleDeviceChange = (newDevice) => {
     setDevice(newDevice);
@@ -62,8 +87,8 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
       if (prev.includes(url)) {
         return prev.filter((entry) => entry !== url);
       }
-      if (prev.length >= 2) {
-        return [prev[1], url];
+      if (prev.length >= MAX_SELECTED_URLS) {
+        return [...prev.slice(1), url];
       }
       return [...prev, url];
     });
@@ -82,8 +107,13 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
       const res = await axios.post('/api/suggest-websites', {
         topic: cleanedTopic,
         country,
+        adSize,
+        device,
+        limit: SUGGESTION_LIMIT,
       });
-      setSuggestions(res.data.suggestions);
+      const rankedSuggestions = res.data.suggestions || [];
+      setSuggestions(rankedSuggestions);
+      setSelectedUrls(getRankedViableUrls(rankedSuggestions).slice(0, mockupCount));
     } catch (err) {
       setSuggestionsError(
         err.response?.data?.error || 'Failed to fetch suggestions. Using fallback...'
@@ -96,31 +126,39 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
   const buildTargetUrls = () => {
     const desiredCount = mockupCount;
     const candidates = [];
+    const addCandidate = (url) => {
+      if (url && !candidates.includes(url)) {
+        candidates.push(url);
+      }
+    };
 
     const customUrl = overrideUrl.trim();
     if (customUrl) {
-      candidates.push(customUrl);
+      addCandidate(customUrl);
     }
 
     for (const url of selectedUrls) {
-      if (!candidates.includes(url)) {
-        candidates.push(url);
-      }
+      addCandidate(url);
+    }
+
+    for (const url of getRankedViableUrls(suggestions || [])) {
+      addCandidate(url);
     }
 
     if (candidates.length === 0) {
-      return { error: 'Please select website suggestions or enter a specific URL' };
+      return { error: 'Please select ranked website suggestions or enter a specific URL' };
     }
 
     if (candidates.length < desiredCount) {
       return {
-        error: desiredCount === 2
-          ? 'Please select two websites (or add one custom URL and one suggested URL)'
-          : 'Please select at least one website',
+        error: `Only ${candidates.length} viable website${candidates.length === 1 ? '' : 's'} available. Reduce the output count or add a custom URL.`,
       };
     }
 
-    return { urls: candidates.slice(0, desiredCount) };
+    return {
+      desiredCount,
+      urls: candidates.slice(0, Math.min(candidates.length, desiredCount + 4)),
+    };
   };
 
   const handleSubmit = async (e) => {
@@ -145,17 +183,20 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
     }
 
     const urls = target.urls;
+    const desiredCount = target.desiredCount;
     setIsSubmitting(true);
     onGenerating(true);
     onProgress('Generating mockups...');
     onResult(null);
 
-    try {
-      const results = [];
+    const results = [];
+    const failures = [];
 
-      for (let index = 0; index < urls.length; index++) {
+    try {
+      for (let index = 0; index < urls.length && results.length < desiredCount; index++) {
         const websiteUrl = urls[index];
-        onProgress(`Generating mockup ${index + 1}/${urls.length}...`);
+        let progressIndex = 0;
+        onProgress(`Generating mockup ${results.length + 1}/${desiredCount} from candidate ${index + 1}/${urls.length}... ${PROGRESS_STEPS[progressIndex]}`);
 
         const formData = new FormData();
         formData.append('websiteUrl', websiteUrl);
@@ -171,31 +212,65 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
           formData.append('adImage', adImage);
         }
 
-        const res = await axios.post('/api/generate-mockup', formData, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-          timeout: 240000,
-        });
+        progressTimerRef.current = setInterval(() => {
+          progressIndex = Math.min(progressIndex + 1, PROGRESS_STEPS.length - 1);
+          onProgress(`Generating mockup ${results.length + 1}/${desiredCount} from candidate ${index + 1}/${urls.length}... ${PROGRESS_STEPS[progressIndex]}`);
+        }, 2500);
 
-        results.push({
-          ...res.data,
-          clientOptions: {
-            alwaysShowSlotPicker,
-          },
-        });
+        try {
+          const res = await axios.post('/api/generate-mockup', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+            timeout: 240000,
+          });
+
+          results.push({
+            ...res.data,
+            clientOptions: {
+              alwaysShowSlotPicker,
+            },
+          });
+        } catch (err) {
+          failures.push({
+            failed: true,
+            websiteUrl,
+            error: err.response?.data?.error || 'Failed to generate this candidate.',
+          });
+        }
+
+        if (progressTimerRef.current) {
+          clearInterval(progressTimerRef.current);
+          progressTimerRef.current = null;
+        }
       }
 
-      onResult(results);
+      if (results.length === 0) {
+        onError(failures[0]?.error || 'No mockups could be generated from the ranked candidates.');
+        return;
+      }
+
+      onResult([...results, ...failures]);
       onProgress('');
     } catch (err) {
+      if (progressTimerRef.current) {
+        clearInterval(progressTimerRef.current);
+        progressTimerRef.current = null;
+      }
       const msg = err.response?.data?.error || 'Failed to generate mockup. Please try again.';
       onError(msg);
     } finally {
+      if (progressTimerRef.current) {
+        clearInterval(progressTimerRef.current);
+        progressTimerRef.current = null;
+      }
       setIsSubmitting(false);
       onGenerating(false);
     }
   };
 
-  const hasAnyUrl = overrideUrl.trim().length > 0 || selectedUrls.length > 0;
+  const hasAnyUrl =
+    overrideUrl.trim().length > 0 ||
+    selectedUrls.length > 0 ||
+    getRankedViableUrls(suggestions || []).length > 0;
 
   return (
     <form onSubmit={handleSubmit} className="p-5 space-y-5">
@@ -251,7 +326,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
           className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg border border-navy text-navy text-sm font-medium hover:bg-navy hover:text-white transition-all disabled:opacity-50"
         >
           <Search size={15} />
-          {suggestionsLoading ? 'Finding websites...' : 'Find publisher websites'}
+          {suggestionsLoading ? 'Scoring websites...' : 'Find & rank publisher websites'}
         </button>
       )}
 
@@ -284,30 +359,25 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-2">
           Output
         </label>
-        <div className="grid grid-cols-2 gap-2">
-          <button
-            type="button"
-            onClick={() => setMockupCount(1)}
-            className={`py-2 rounded-lg border text-sm font-medium ${
-              mockupCount === 1
-                ? 'border-accent bg-accent/10 text-accent'
-                : 'border-gray-200 text-text-primary hover:bg-gray-50'
-            }`}
-          >
-            1 Site
-          </button>
-          <button
-            type="button"
-            onClick={() => setMockupCount(2)}
-            className={`py-2 rounded-lg border text-sm font-medium ${
-              mockupCount === 2
-                ? 'border-accent bg-accent/10 text-accent'
-                : 'border-gray-200 text-text-primary hover:bg-gray-50'
-            }`}
-          >
-            2 Sites
-          </button>
+        <div className="grid grid-cols-4 gap-2">
+          {MOCKUP_COUNT_OPTIONS.map((count) => (
+            <button
+              key={count}
+              type="button"
+              onClick={() => setMockupCount(count)}
+              className={`py-2 rounded-lg border text-sm font-medium ${
+                mockupCount === count
+                  ? 'border-accent bg-accent/10 text-accent'
+                  : 'border-gray-200 text-text-primary hover:bg-gray-50'
+              }`}
+            >
+              {count}
+            </button>
+          ))}
         </div>
+        <p className="text-xs text-text-muted mt-1">
+          Ranked alternates are tried automatically until the requested count is reached.
+        </p>
       </div>
 
       <hr className="border-gray-100" />
