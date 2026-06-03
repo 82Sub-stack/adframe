@@ -46,7 +46,7 @@ function isBlockedDomain(url) {
  * Falls back to hardcoded list if Gemini API fails.
  */
 async function suggestWebsites(topic, country, options = {}) {
-  const limit = Math.max(3, Math.min(Number.parseInt(options.limit, 10) || 12, 20));
+  const limit = Math.max(3, Math.min(Number.parseInt(options.limit, 10) || 24, 30));
   const blockedList = BLOCKED_DOMAINS.join(', ');
 
   const prompt = `You are a digital media planning assistant. Given a topic/vertical and a target country, suggest exactly ${limit} real, active publisher websites that:

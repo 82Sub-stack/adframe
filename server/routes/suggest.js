@@ -5,8 +5,8 @@ const { preflightSuggestions } = require('../services/preflight');
 
 function parseLimit(value) {
   const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed) || parsed < 1) return 12;
-  return Math.min(parsed, 20);
+  if (!Number.isFinite(parsed) || parsed < 1) return 24;
+  return Math.min(parsed, 30);
 }
 
 router.post('/', async (req, res) => {
@@ -19,7 +19,7 @@ router.post('/', async (req, res) => {
 
     const suggestionLimit = parseLimit(limit);
     const rawSuggestions = await suggestWebsites(topic, country, {
-      limit: Math.max(suggestionLimit, 12),
+      limit: Math.max(suggestionLimit, 24),
     });
     const suggestions = await preflightSuggestions(rawSuggestions, {
       topic,
