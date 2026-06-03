@@ -2,12 +2,68 @@
   "name": "adframe",
   "version": "1.0.0",
   "description": "AdFrame - Ad placement mockup generator for digital media agencies",
+  "main": "electron/main.js",
   "scripts": {
     "install:all": "cd client && npm install && cd ../server && npm install",
     "build": "cd client && npm run build",
     "start": "cd server && node server.js",
     "dev:server": "cd server && node --watch server.js",
     "dev:client": "cd client && npm run dev",
+    "desktop:dev": "npm run build && electron .",
+    "desktop:prepare-chromium": "node scripts/prepare-chromium.js",
+    "desktop:build": "npm run build && npm run desktop:prepare-chromium && electron-builder",
+    "desktop:pack:mac": "npm run build && npm run desktop:prepare-chromium && electron-builder --mac",
+    "desktop:pack:win": "npm run build && npm run desktop:prepare-chromium && electron-builder --win",
     "postinstall": "cd client && npm install && cd ../server && npm install"
+  },
+  "devDependencies": {
+    "electron": "^41.7.0",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId": "com.adframe.desktop",
+    "productName": "AdFrame",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "electron/**/*",
+      "scripts/**/*",
+      "server/**/*",
+      "server/node_modules/**/*",
+      "client/dist/**/*",
+      "package.json",
+      "!server/output/**/*",
+      "!server/tmp/**/*",
+      "!server/data/**/*",
+      "!server/.local-chromium/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "server/.local-chromium",
+        "to": "chromium",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "server/node_modules/sharp/**/*",
+      "server/node_modules/@img/**/*"
+    ],
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "identity": null
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    }
   }
 }

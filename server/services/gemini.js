@@ -5,15 +5,19 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { getFallbackPublishers } = require('./fallback-publishers');
 const { BLOCKED_DOMAINS } = require('./blocked-domains');
+const { getGeminiApiKey } = require('./settings-store');
 
 let genAI = null;
+let activeApiKey = null;
 
 function getClient() {
-  if (!genAI) {
-    if (!process.env.GEMINI_API_KEY) {
+  const apiKey = getGeminiApiKey();
+  if (!genAI || activeApiKey !== apiKey) {
+    if (!apiKey) {
       throw new Error('GEMINI_API_KEY environment variable is not set');
     }
-    genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    genAI = new GoogleGenerativeAI(apiKey);
+    activeApiKey = apiKey;
   }
   return genAI;
 }

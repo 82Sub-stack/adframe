@@ -1,34 +1,25 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 const sharp = require('sharp');
 const path = require('path');
 const fs = require('fs');
 const { captureWebsite } = require('../services/puppeteer');
 const { generateMockup } = require('../services/ad-injector');
 const { isBlockedDomain } = require('../services/gemini');
+const { getEffectiveOutputDir, getUploadDir } = require('../services/settings-store');
 const queue = require('../utils/queue');
 
 // Store generated mockups in memory (use disk/S3 in production)
 const mockupStore = new Map();
 
-// Ensure output directory exists
-const outputDir = path.join(__dirname, '..', 'output');
-const uploadDir = path.join(__dirname, '..', 'tmp', 'uploads');
-if (!fs.existsSync(outputDir)) {
-  fs.mkdirSync(outputDir, { recursive: true });
-}
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
-}
-
 // Configure multer for disk-backed uploads to avoid holding creatives in RAM.
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
+  destination: (req, file, cb) => cb(null, getUploadDir()),
   filename: (req, file, cb) => {
     const extension = path.extname(file.originalname || '').toLowerCase() || '.bin';
-    cb(null, `${uuidv4()}${extension}`);
+    cb(null, `${randomUUID()}${extension}`);
   },
 });
 const upload = multer({
@@ -396,7 +387,9 @@ function storeMockupResult({
   request,
   adTag,
 }) {
-  const mockupId = uuidv4();
+  const mockupId = randomUUID();
+  const outputDir = getEffectiveOutputDir();
+  fs.mkdirSync(outputDir, { recursive: true });
   const mockupPath = path.join(outputDir, `${mockupId}.png`);
   fs.writeFileSync(mockupPath, mockupBuffer);
 
