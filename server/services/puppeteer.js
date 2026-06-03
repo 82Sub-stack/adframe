@@ -40,8 +40,14 @@ const ADTAG_RENDER_MAX_WAIT_MS = Number.parseInt(
   process.env.ADTAG_RENDER_MAX_WAIT_MS,
   10
 ) || (IS_PRODUCTION ? 8000 : 12000);
+const BROWSER_RECYCLE_EVERY = Number.parseInt(
+  process.env.BROWSER_RECYCLE_EVERY || '',
+  10
+) || (IS_PRODUCTION ? 25 : 0);
 
 let browserInstance = null;
+let activeBrowserJobs = 0;
+let completedBrowserJobs = 0;
 
 function isTallFormat(width, height) {
   return height / Math.max(1, width) >= 1.7;
@@ -137,6 +143,26 @@ async function getBrowser() {
   return browserInstance;
 }
 
+function beginBrowserJob() {
+  activeBrowserJobs += 1;
+}
+
+async function endBrowserJob() {
+  activeBrowserJobs = Math.max(0, activeBrowserJobs - 1);
+  completedBrowserJobs += 1;
+
+  if (
+    BROWSER_RECYCLE_EVERY > 0 &&
+    completedBrowserJobs >= BROWSER_RECYCLE_EVERY &&
+    activeBrowserJobs === 0 &&
+    browserInstance
+  ) {
+    console.log(`Recycling browser after ${completedBrowserJobs} completed jobs`);
+    await closeBrowser();
+    completedBrowserJobs = 0;
+  }
+}
+
 /**
  * Detect existing ad slots/iframes and return ranked candidates.
  */
@@ -177,10 +203,24 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       return (visibleW * visibleH) / area;
     };
 
+    const hasStickyAncestor = (el) => {
+      let current = el.parentElement;
+      let depth = 0;
+      while (current && depth < 5) {
+        const style = getComputedStyle(current);
+        if (style.position === 'fixed' || style.position === 'sticky') return true;
+        current = current.parentElement;
+        depth += 1;
+      }
+      return false;
+    };
+
     const pushSlot = (el, rect, type, isAdLikely) => {
       if (!isVisible(el, rect)) return;
       if (rect.width < 50 || rect.height < 30) return;
 
+      const style = getComputedStyle(el);
+      const signature = `${el.id || ''} ${String(el.className || '')}`.toLowerCase();
       const text = ((el.textContent || '') + '').replace(/\s+/g, ' ').trim();
       const textLength = Math.min(500, text.length);
       const headingCount = el.querySelectorAll('h1, h2, h3, h4').length;
@@ -188,6 +228,17 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       const hasArticleSignals =
         el.matches('article, main, [role="main"]') ||
         Boolean(el.querySelector('article, time, header h1, header h2'));
+      const insideArticle = Boolean(el.closest('article, main, [role="main"]'));
+      const insideHeader = Boolean(el.closest('header, [role="banner"], nav, [role="navigation"]'));
+      const insideFooter = Boolean(el.closest('footer, [role="contentinfo"]'));
+      const insideSidebar = Boolean(
+        el.closest('aside, [class*="sidebar"], [id*="sidebar"], [class*="rail"], [id*="rail"], [class*="column-right"], [id*="column-right"]')
+      );
+      const isFixedOrSticky = style.position === 'fixed' || style.position === 'sticky';
+      const iframeCount = (el.tagName === 'IFRAME' ? 1 : 0) + el.querySelectorAll('iframe').length;
+      const visualChildCount = iframeCount + el.querySelectorAll('img, picture, svg, canvas, video').length;
+      const hasAdHints = /(ad|gpt|advert|banner|sponsor|billboard|leaderboard|skyscraper|rectangle|slot|promo)/.test(signature);
+      const looksLikePlaceholder = textLength < 40 && headingCount === 0 && paragraphCount === 0 && visualChildCount <= 1;
 
       results.push({
         slotId: getSlotId(el),
@@ -202,6 +253,16 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
         headingCount,
         paragraphCount,
         hasArticleSignals,
+        insideArticle,
+        insideHeader,
+        insideFooter,
+        insideSidebar,
+        isFixedOrSticky,
+        hasStickyAncestor: hasStickyAncestor(el),
+        iframeCount,
+        visualChildCount,
+        hasAdHints,
+        looksLikePlaceholder,
       });
     };
 
@@ -294,6 +355,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
 
   const targetArea = targetWidth * targetHeight;
   const targetRatio = targetWidth / targetHeight;
+  const maxTrustedY = device === 'mobile' ? 2400 : maxCandidateY;
 
   // De-duplicate by slotId.
   const deduped = new Map();
@@ -318,32 +380,116 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
     const ratioMatch = Math.max(0, 1 - Math.abs(ratio - targetRatio));
     const area = s.width * s.height;
     const areaMatch = Math.max(0, 1 - Math.abs(area - targetArea) / targetArea);
+    const widthScale = s.width / Math.max(1, targetWidth);
+    const heightScale = s.height / Math.max(1, targetHeight);
+    const aspectScaleDelta = Math.abs((ratio / Math.max(0.01, targetRatio)) - 1);
 
     let score = 0;
+    const reasons = [];
     score += widthMatch * 35;
     score += heightMatch * 35;
     score += ratioMatch * 20;
     score += areaMatch * 10;
     score += s.viewportRatio * 15;
 
-    if (s.isAd) score += 28;
-    if (s.type === 'gpt') score += 18;
-    else if (s.type === 'iframe') score += 14;
-    else if (s.type === 'size-match') score += 6;
+    if (s.isAd) {
+      score += 28;
+      reasons.push('ad-signals');
+    }
+    if (s.hasAdHints) {
+      score += 16;
+      reasons.push('selector-hints');
+    }
+    if (s.type === 'gpt') {
+      score += 18;
+      reasons.push('gpt-slot');
+    } else if (s.type === 'iframe') {
+      score += 14;
+      reasons.push('iframe-slot');
+    } else if (s.type === 'size-match') {
+      score += 6;
+      reasons.push('size-match');
+    }
+
+    if (s.insideSidebar) {
+      score += 18;
+      reasons.push('sidebar');
+    }
+    if (s.iframeCount > 0) {
+      score += 10;
+      reasons.push('nested-iframe');
+    }
+    if (s.looksLikePlaceholder) {
+      score += 8;
+      reasons.push('placeholder-like');
+    }
+
+    const isNearExactSize =
+      widthScale >= 0.9 && widthScale <= 1.12 &&
+      heightScale >= 0.9 && heightScale <= 1.12 &&
+      aspectScaleDelta <= 0.12;
+    const isCompatibleSize =
+      widthScale >= 0.75 && widthScale <= 1.35 &&
+      heightScale >= 0.75 && heightScale <= 1.35 &&
+      aspectScaleDelta <= 0.22;
+    const isOversizedContainer =
+      widthScale >= 0.85 && widthScale <= 1.2 &&
+      heightScale > 1.35 && heightScale <= 2.2;
+    const hasHardSizeMismatch =
+      widthScale < 0.7 || widthScale > 1.45 ||
+      heightScale < 0.7 || heightScale > 1.45 ||
+      aspectScaleDelta > 0.28;
+
+    if (isNearExactSize) {
+      score += 26;
+      reasons.push('near-exact-size');
+    } else if (isCompatibleSize) {
+      score += 10;
+      reasons.push('compatible-size');
+    } else if (isOversizedContainer) {
+      score -= 30;
+      reasons.push('oversized-slot');
+    }
 
     if (s.textLength > 80) score -= 25;
     if (s.textLength > 220) score -= 40;
     if (s.headingCount > 0) score -= 30;
     if (s.paragraphCount > 2) score -= 15;
     if (s.hasArticleSignals) score -= 45;
+    if (s.visualChildCount > 4 && !s.isAd) score -= 12;
+
+    if (s.insideHeader) {
+      score -= 48;
+      reasons.push('header-penalty');
+    }
+    if (s.insideFooter) {
+      score -= 32;
+      reasons.push('footer-penalty');
+    }
+    if (s.isFixedOrSticky) {
+      score -= 42;
+      reasons.push('sticky-slot');
+    }
+    if (s.hasStickyAncestor) {
+      score -= 28;
+      reasons.push('sticky-ancestor');
+    }
+    if (s.insideArticle && !s.isAd && !s.hasAdHints) {
+      score -= 40;
+      reasons.push('editorial-context');
+    }
 
     if (!s.isAd && s.type === 'iframe') score -= 20;
     if (!s.isAd && s.type === 'div') score -= 50;
 
-    if (s.y >= 60 && s.y < 3200) score += 10;
+    if (s.y >= 60 && s.y < maxTrustedY) score += 10;
     if (s.y > 6500) score -= 25;
     if (area < targetArea * 0.5) score -= 30;
     if (area > targetArea * 4) score -= 18;
+    if (hasHardSizeMismatch) {
+      score -= 55;
+      reasons.push('dimension-mismatch');
+    }
 
     if (tallFormat) {
       if (s.height < Math.max(260, targetHeight * 0.65)) score -= 90;
@@ -358,14 +504,36 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       if (ratio < 1.6) score -= 40;
     }
 
-    return { ...s, score: Math.round(score) };
+    const roundedScore = Math.round(score);
+    const structuralReject = !s.isAd && (
+      s.insideHeader ||
+      s.isFixedOrSticky ||
+      s.hasStickyAncestor ||
+      (s.insideArticle && s.textLength > 120 && !s.hasAdHints)
+    );
+    const dimensionReject = hasHardSizeMismatch || isOversizedContainer;
+
+    let confidence = 'low';
+    if (roundedScore >= 105) confidence = 'high';
+    else if (roundedScore >= 85) confidence = 'medium';
+
+    return {
+      ...s,
+      score: roundedScore,
+      confidence,
+      structuralReject,
+      dimensionReject,
+      reasons,
+    };
   });
 
   scored.sort((a, b) => b.score - a.score);
   const candidates = scored
-    .filter((c) => c.score >= 55)
+    .filter((c) => c.score >= 65)
     .filter((c) => c.isAd || c.type === 'iframe' || c.type === 'gpt')
     .filter((c) => isFormatCompatibleSlot(c, targetWidth, targetHeight, device))
+    .filter((c) => !c.structuralReject)
+    .filter((c) => !c.dimensionReject)
     .filter((c) => c.y >= 0 && c.y <= maxCandidateY)
     .slice(0, 8)
     .map((c) => ({
@@ -375,15 +543,21 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       slotWidth: Math.round(c.width),
       slotHeight: Math.round(c.height),
       score: c.score,
+      confidence: c.confidence,
       type: c.type,
       isAd: c.isAd,
+      reasons: c.reasons.slice(0, 4),
     }));
 
-  const best = candidates[0] || null;
+  const best = candidates.find((candidate) => candidate.confidence !== 'low') || null;
 
   if (best) {
     console.log(
-      `Detected ad slot: ${best.type} at (${best.x}, ${best.y}) size ${best.slotWidth}x${best.slotHeight}, score=${best.score}`
+      `Detected ad slot: ${best.type} at (${best.x}, ${best.y}) size ${best.slotWidth}x${best.slotHeight}, score=${best.score}, confidence=${best.confidence}`
+    );
+  } else if (candidates[0]) {
+    console.log(
+      `No trusted ad slot found; best weak candidate score=${candidates[0].score}, confidence=${candidates[0].confidence}`
     );
   }
 
@@ -1024,6 +1198,7 @@ async function captureWebsite(
   injectionOptions = null
 ) {
   const browser = await getBrowser();
+  beginBrowserJob();
   const page = await browser.newPage();
 
   try {
@@ -1208,6 +1383,7 @@ async function captureWebsite(
     } catch (err) {
       console.warn('Failed to close capture page cleanly:', err?.message || err);
     }
+    await endBrowserJob();
   }
 }
 
@@ -1217,6 +1393,7 @@ async function captureWebsite(
  */
 async function renderAdTag(adTag, width, height) {
   const browser = await getBrowser();
+  beginBrowserJob();
   const page = await browser.newPage();
   const adTagType = classifyAdTag(adTag);
   const wrappedHtml = buildWrappedAdHtml(adTag, width, height);
@@ -1380,6 +1557,7 @@ async function renderAdTag(adTag, width, height) {
     } catch (err) {
       console.warn('Failed to close adtag page cleanly:', err?.message || err);
     }
+    await endBrowserJob();
   }
 }
 
@@ -1409,6 +1587,8 @@ async function closeBrowser() {
     await browserInstance.close();
     browserInstance = null;
   }
+  activeBrowserJobs = 0;
+  completedBrowserJobs = 0;
 }
 
 module.exports = {

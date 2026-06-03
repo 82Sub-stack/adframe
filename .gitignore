@@ -3,4 +3,8 @@ dist/
 .env
 *.log
 server/output/
+server/tmp/
+server/data/
+server/.local-chromium/
+release/
 .DS_Store

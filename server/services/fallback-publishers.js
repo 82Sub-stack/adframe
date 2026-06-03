@@ -156,32 +156,50 @@ const FALLBACK_DATA = {
 /**
  * Get fallback publisher suggestions for a given topic and country.
  */
-function getFallbackPublishers(topic, country) {
-  // Try exact match
+function addUnique(target, items) {
+  const seen = new Set(target.map((item) => item.url));
+  for (const item of items || []) {
+    if (item?.url && !seen.has(item.url)) {
+      target.push(item);
+      seen.add(item.url);
+    }
+  }
+}
+
+function getFallbackPublishers(topic, country, limit = 3) {
+  const maxResults = Math.max(1, Number.parseInt(limit, 10) || 3);
+  const results = [];
+
   const countryData = FALLBACK_DATA[country];
   if (countryData) {
-    // Try exact topic match
     if (countryData[topic]) {
-      return countryData[topic];
+      addUnique(results, countryData[topic]);
     }
-    // Try case-insensitive topic match
+
     const topicKey = Object.keys(countryData).find(
       k => k.toLowerCase() === topic.toLowerCase()
     );
-    if (topicKey) {
-      return countryData[topicKey];
+    if (topicKey && topicKey !== topic) {
+      addUnique(results, countryData[topicKey]);
     }
-    // Fall back to News for that country
+
     if (countryData.News) {
-      return countryData.News;
+      addUnique(results, countryData.News);
     }
-    // Return first available topic
-    const firstTopic = Object.keys(countryData)[0];
-    return countryData[firstTopic];
+
+    for (const key of Object.keys(countryData)) {
+      addUnique(results, countryData[key]);
+    }
+
+    return results.slice(0, maxResults);
   }
 
   // Ultimate fallback: German news sites
-  return FALLBACK_DATA.Germany.News;
+  addUnique(results, FALLBACK_DATA.Germany.News);
+  for (const key of Object.keys(FALLBACK_DATA.Germany)) {
+    addUnique(results, FALLBACK_DATA.Germany[key]);
+  }
+  return results.slice(0, maxResults);
 }
 
 module.exports = {

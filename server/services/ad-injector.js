@@ -116,6 +116,7 @@ async function generateMockup({
   adSize,
   adTag,
   adImageBuffer,
+  adImagePath,
   detectedSlot,
   allowHeuristicFallback = true,
 }) {
@@ -125,8 +126,8 @@ async function generateMockup({
   let adCreativeBuffer;
   let adTagRendered = false;
 
-  if (adImageBuffer) {
-    adCreativeBuffer = adImageBuffer;
+  if (adImagePath || adImageBuffer) {
+    adCreativeBuffer = adImagePath || adImageBuffer;
   } else if (adTag) {
     const renderedCreative = await renderAdTag(adTag, adWidth, adHeight);
     adCreativeBuffer = renderedCreative?.imageBuffer || null;
@@ -198,6 +199,10 @@ async function generateMockup({
       adSizeName: getAdSizeName(adSize),
       method: placementMethod,
       adTagRendered,
+      confidence: detectedSlot?.confidence || (placementMethod === 'heuristic' ? 'low' : undefined),
+      detectionScore: detectedSlot?.score,
+      slotType: detectedSlot?.type,
+      detectionReasons: detectedSlot?.reasons || [],
     },
   };
 }
