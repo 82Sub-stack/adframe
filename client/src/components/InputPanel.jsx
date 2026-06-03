@@ -19,7 +19,7 @@ const PROGRESS_STEPS = [
   'Generating mockup...',
 ];
 
-const SUGGESTION_LIMIT = 12;
+const SUGGESTION_LIMIT = 24;
 const MAX_SELECTED_URLS = 5;
 const MOCKUP_COUNT_OPTIONS = [1, 2, 3, 5];
 
