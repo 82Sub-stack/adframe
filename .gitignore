@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.env.signing
 *.log
 server/output/
 server/tmp/
