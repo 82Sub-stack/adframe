@@ -2,6 +2,7 @@
   "name": "adframe",
   "version": "1.0.0",
   "description": "AdFrame - Ad placement mockup generator for digital media agencies",
+  "author": "82Sub-stack",
   "main": "electron/main.js",
   "scripts": {
     "install:all": "cd client && npm install && cd ../server && npm install",
@@ -13,7 +14,7 @@
     "desktop:prepare-chromium": "node scripts/prepare-chromium.js",
     "desktop:build": "npm run build && npm run desktop:prepare-chromium && electron-builder",
     "desktop:pack:mac": "npm run build && npm run desktop:prepare-chromium && electron-builder --mac",
-    "desktop:pack:win": "npm run build && npm run desktop:prepare-chromium && electron-builder --win",
+    "desktop:pack:win": "npm run build && npm run desktop:prepare-chromium -- --platform win64 && electron-builder --win --x64",
     "postinstall": "cd client && npm install && cd ../server && npm install"
   },
   "devDependencies": {
