@@ -32,17 +32,21 @@ function getStatusInfo(preflight) {
   };
 }
 
-function getSignalChips(preflight) {
+function getSignalChips(preflight, slotProbe) {
   if (!preflight) return [];
   const chips = [];
 
+  if (slotProbe?.status === 'ok') {
+    chips.push(`Slot ${slotProbe.bestSlot?.confidence || 'found'}`);
+  }
   if (preflight.adSlotLikely) chips.push('Ad signals');
   if (preflight.adSizeCompatible) chips.push('Size match');
   if (preflight.mobileReady) chips.push('Mobile ready');
   if (preflight.topicScore >= 10) chips.push('Topic match');
+  if (preflight.countryFit) chips.push('Country fit');
   if (preflight.paywallRisk) chips.push('Paywall risk');
 
-  return chips.slice(0, 4);
+  return chips.slice(0, 5);
 }
 
 export default function WebsiteSuggestions({ suggestions, loading, error, selectedUrls = [], onToggle }) {
@@ -89,7 +93,7 @@ export default function WebsiteSuggestions({ suggestions, loading, error, select
           const selected = selectedUrls.includes(site.url);
           const statusInfo = getStatusInfo(preflight);
           const StatusIcon = statusInfo.Icon;
-          const chips = getSignalChips(preflight);
+          const chips = getSignalChips(preflight, site.slotProbe);
 
           return (
             <button
@@ -134,7 +138,11 @@ export default function WebsiteSuggestions({ suggestions, loading, error, select
                   ))}
                 </div>
 
-                <div className="text-xs text-text-muted mt-1.5 leading-relaxed">{site.reason}</div>
+                <div className="text-xs text-text-muted mt-1.5 leading-relaxed">
+                  {site.slotProbe?.bestSlot
+                    ? `Detected ${site.slotProbe.bestSlot.type} slot, score ${site.slotProbe.bestSlot.score}`
+                    : (preflight?.reasons?.length ? preflight.reasons.slice(0, 3).join(' | ') : site.reason)}
+                </div>
                 {Array.isArray(preflight?.warnings) && preflight.warnings.length > 0 && (
                   <div className="text-xs text-yellow-800 mt-1">
                     {preflight.warnings.slice(0, 2).join(' | ')}

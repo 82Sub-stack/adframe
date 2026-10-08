@@ -15,6 +15,7 @@ const CMP_STRATEGIES = [
   { name: 'Usercentrics-Alt',container: '#usercentrics-root',                accept: '#uc-btn-accept-banner' },
   { name: 'Usercentrics-Cls',container: '#usercentrics-root',                accept: '.uc-list-button__accept-all' },
   { name: 'Quantcast',       container: '.qc-cmp2-container',               accept: "button[mode='primary']" },
+  { name: 'ConsentManager',  container: '#cmpwrapper, .cmpwrapper',         accept: "button, a, [role='button']" },
 ];
 
 const CONSENT_COOKIES = [
@@ -62,6 +63,10 @@ const CONSENT_CLICK_SELECTORS = [
   'button[title="Alle akzeptieren"]',
   'button[title="Accept All"]',
   'button[title="Zustimmen und weiter"]',
+  'button[title="Einwilligen & weiter"]',
+  'button[title="Einwilligen und weiter"]',
+  'button[title="Weiter mit Werbung"]',
+  'button[title="Weiter mit Werbung ..."]',
   'button[title="AGREE"]',
   '.sp_choice_type_11',
   '.message-button.sp_choice_type_11',
@@ -93,10 +98,13 @@ const CONSENT_CLICK_SELECTORS = [
   'button[id*="agree"]',
   '[data-testid*="accept"]',
   '[data-testid*="consent"]',
+  '[data-testid*="cmp"]',
   'button[aria-label*="accept"]',
   'button[aria-label*="Accept"]',
   'button[aria-label*="Akzeptieren"]',
   'button[aria-label*="Zustimmen"]',
+  'button[aria-label*="Einwilligen"]',
+  'button[aria-label*="Werbung"]',
   'button[aria-label*="agree"]',
   'button[aria-label*="Agree"]',
 
@@ -108,37 +116,61 @@ const CONSENT_CLICK_SELECTORS = [
   'button:has-text("Accetta tutto")',
 ];
 
-const OVERLAY_SELECTORS = [
-  '[class*="consent"]',
-  '[id*="consent"]',
-  '[class*="cookie-banner"]',
-  '[id*="cookie-banner"]',
-  '[id*="cookie"]',
-  '.cmp-modal',
-  '.cmp-overlay',
-  '[class*="privacy-wall"]',
-  '[class*="gdpr"]',
-  '[id*="gdpr"]',
-  '#usercentrics-root',
-  '[id*="sp_message"]',
-  '.message-overlay',
-  '[class*="cookie-notice"]',
-  '[id*="cookie-notice"]',
+const CONSENT_ACCEPT_TEXTS = [
+  'Accept All',
+  'Accept all',
+  'Alle akzeptieren',
+  'Alles akzeptieren',
+  'Alle zulassen',
+  'Auswahl akzeptieren',
+  'Akzeptieren',
+  'Zustimmen',
+  'Zustimmen und weiter',
+  'Einwilligen',
+  'Einwilligen & weiter',
+  'Einwilligen und weiter',
+  'Weiter mit Werbung',
+  'Weiter mit Werbung ...',
+  'Mit Werbung weiter',
+  'Mit Werbung fortfahren',
+  'Consent and continue',
+  'Agree',
+  'AGREE',
+  'I Accept',
+  'OK',
+  'Tout accepter',
+  'Aceptar todo',
+  'Accetta tutto',
+  'Alle accepteren',
+  'Zaakceptuj wszystko',
+];
+
+const OVERLAY_TEXT_MARKERS = [
+  'cookies entgeltfrei',
+  'consentpass',
+  'contentpass',
+  'weiter mit werbung',
+  'mit werbung weiter',
+  'einwilligen & weiter',
+  'einwilligen und weiter',
+  'ablehnen & abonnieren',
+  'personalisierte werbung',
+  'datenschutzeinstellungen',
+  'privacy settings',
+  'consent layer',
 ];
 
 /**
  * Set consent cookies for the target domain before navigation.
  */
 async function setConsentCookies(page, url) {
-  const domain = new URL(url).hostname;
-  const baseDomain = domain.replace(/^www\./, '');
+  const parsedUrl = new URL(url);
 
   const cookies = CONSENT_COOKIES.map(cookie => ({
     ...cookie,
-    domain: `.${baseDomain}`,
-    path: '/',
+    url: parsedUrl.origin,
     httpOnly: false,
-    secure: true,
+    secure: parsedUrl.protocol === 'https:',
     sameSite: 'Lax',
   }));
 
@@ -154,23 +186,46 @@ async function setConsentCookies(page, url) {
  */
 async function handleShadowDOMConsent(page) {
   try {
-    await page.evaluate(() => {
-      const shadowHosts = document.querySelectorAll(
-        '#usercentrics-root, [id*="usercentrics"], #shadow-root-container'
-      );
-      shadowHosts.forEach(host => {
+    return await page.evaluate((acceptTexts) => {
+      const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const targets = acceptTexts.map(normalize);
+      const shadowHosts = [...document.querySelectorAll('*')].filter((host) => host.shadowRoot);
+
+      for (const host of shadowHosts) {
         const shadow = host.shadowRoot;
-        if (shadow) {
-          const acceptBtn =
-            shadow.querySelector('button[data-testid="uc-accept-all-button"]') ||
-            shadow.querySelector('button[contains="Accept All"]') ||
-            shadow.querySelector('button.accept-all');
-          if (acceptBtn) acceptBtn.click();
+        const candidates = shadow.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]');
+
+        for (const btn of candidates) {
+          const style = getComputedStyle(btn);
+          const rect = btn.getBoundingClientRect();
+          if (
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            parseFloat(style.opacity || '1') < 0.05 ||
+            rect.width < 20 ||
+            rect.height < 10
+          ) {
+            continue;
+          }
+
+          const text = normalize(
+            btn.textContent ||
+            btn.value ||
+            btn.getAttribute('aria-label') ||
+            btn.getAttribute('title')
+          );
+          if (targets.some((target) => text === target || text.startsWith(target) || text.includes(target))) {
+            btn.click();
+            return true;
+          }
         }
-      });
-    });
+      }
+
+      return false;
+    }, CONSENT_ACCEPT_TEXTS);
   } catch (err) {
     // Shadow DOM not present or not accessible
+    return false;
   }
 }
 
@@ -290,80 +345,128 @@ async function clickConsentButtons(page) {
     }
   }
 
-  // Text-based matching fallback
+  return clickConsentByTextInFrames(page);
+}
+
+async function clickConsentByTextInFrame(frame) {
   try {
-    const clicked = await page.evaluate(() => {
-      const acceptTexts = [
-        'Accept All', 'Accept all', 'Alle akzeptieren', 'Alles akzeptieren',
-        'Tout accepter', 'Aceptar todo', 'Accetta tutto', 'Alle accepteren',
-        'Zaakceptuj wszystko', 'AGREE', 'Agree', 'I Accept', 'OK',
-        'Zustimmen', 'Einverstanden', 'Akzeptieren',
-      ];
-      const buttons = document.querySelectorAll('button, a[role="button"], [role="button"]');
-      for (const btn of buttons) {
-        const text = btn.textContent.trim();
-        if (acceptTexts.some(t => text === t || text.startsWith(t))) {
-          btn.click();
-          return true;
+    const candidates = await frame.$$('button, a, a[role="button"], [role="button"], input[type="button"], input[type="submit"]');
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const targets = CONSENT_ACCEPT_TEXTS.map(normalize);
+
+    for (const candidate of candidates) {
+      const match = await candidate.evaluate((btn, targetTexts) => {
+        const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const style = getComputedStyle(btn);
+        const rect = btn.getBoundingClientRect();
+        if (
+          style.display === 'none' ||
+          style.visibility === 'hidden' ||
+          parseFloat(style.opacity || '1') < 0.05 ||
+          rect.width < 20 ||
+          rect.height < 10
+        ) {
+          return false;
         }
+
+        const text = normalizeText(
+          btn.textContent ||
+          btn.value ||
+          btn.getAttribute('aria-label') ||
+          btn.getAttribute('title')
+        );
+        if (!text) return false;
+
+        const context = btn.closest('dialog,[role="dialog"],[aria-modal="true"],[id*="consent"],[class*="consent"],[id*="cmp"],[class*="cmp"],[id*="didomi"],[id*="onetrust"],[id*="sp_message"]');
+        const inCmpFrame = /consent|cmp|privacy|sp_message/.test(location.href);
+        if (!context && !inCmpFrame) return false;
+        return targetTexts.some((target) => text === target || (target.length >= 10 && text.startsWith(target)));
+      }, targets);
+
+      if (match) {
+        await candidate.click({ delay: 50 });
+        await new Promise(r => setTimeout(r, 500));
+        return true;
       }
-      return false;
-    });
-    return clicked;
-  } catch (err) {
+    }
+
+    return false;
+  } catch {
     return false;
   }
+}
+
+async function clickConsentByTextInFrames(page) {
+  if (await clickConsentByTextInFrame(page.mainFrame())) {
+    console.log('Consent handled via text match');
+    return true;
+  }
+
+  for (const frame of page.frames()) {
+    if (frame === page.mainFrame()) continue;
+    if (await clickConsentByTextInFrame(frame)) {
+      console.log('Consent handled via text match in iframe');
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
  * Force-remove consent overlay elements as a last resort.
  */
 async function removeConsentOverlays(page) {
-  try {
-    const removed = await page.evaluate((selectors) => {
-      let removedCount = 0;
-      selectors.forEach(sel => {
-        document.querySelectorAll(sel).forEach(el => {
-          const style = getComputedStyle(el);
-          const isOverlay =
-            el.offsetHeight > 200 ||
-            style.position === 'fixed' ||
-            style.position === 'absolute' ||
-            parseInt(style.zIndex) > 999;
-          if (isOverlay) {
-            el.remove();
-            removedCount++;
-          }
-        });
-      });
-
-      // Also remove any high z-index fixed elements that look like overlays
-      document.querySelectorAll('div, section, aside').forEach(el => {
-        const style = getComputedStyle(el);
-        if (
-          (style.position === 'fixed' || style.position === 'sticky') &&
-          parseInt(style.zIndex) > 9000 &&
-          el.offsetHeight > 100
-        ) {
-          el.remove();
-          removedCount++;
-        }
-      });
-
-      // Restore scrolling
-      document.body.style.overflow = '';
-      document.body.style.overflowY = '';
-      document.documentElement.style.overflow = '';
-      document.documentElement.style.overflowY = '';
-      document.body.classList.remove('sp-message-open', 'modal-open', 'no-scroll');
-
-      return removedCount;
-    }, OVERLAY_SELECTORS);
-
+  return page.evaluate((markers) => {
+    const normalize = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const protectedContent = el => el.matches('html,body,main,article,#app,#root,#__next,#__nuxt') || Boolean(el.querySelector('main,article,[role="main"]'));
+    const isConsentDialog = el => {
+      if (protectedContent(el)) return false;
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      if (style.display === 'none' || style.visibility === 'hidden' || rect.width < 1 || rect.height < 1) return false;
+      const signature = normalize(`${el.id} ${el.className} ${el.getAttribute('src') || ''}`);
+      const knownCmp = /onetrust|didomi|sp_message|usercentrics|cybotcookiebot|qc-cmp|cmpwrapper/.test(signature);
+      const consentSignature = /(?:^|[\s_-])(?:consent|cookie-banner|cookie-notice|cmp-modal|privacy-wall)(?:$|[\s_-])/.test(signature);
+      const text = normalize(`${el.textContent || ''} ${el.shadowRoot?.textContent || ''}`).slice(0, 2000);
+      const marker = markers.some(value => text.includes(value));
+      const modal = el.matches('dialog,[role="dialog"],[aria-modal="true"]');
+      const blocking = style.position === 'fixed' || (style.position === 'absolute' && Number(style.zIndex) > 100);
+      // Large publisher wrappers and consent links in footers are never sufficient evidence.
+      return knownCmp || (modal && (marker || consentSignature)) || (blocking && consentSignature && marker);
+    };
+    let removed = 0;
+    const roots = [...document.querySelectorAll('dialog,[role="dialog"],[aria-modal="true"],body *')];
+    for (const el of roots) {
+      if (el.isConnected && isConsentDialog(el)) { el.remove(); removed++; }
+    }
+    if (removed) {
+      for (const el of document.querySelectorAll('[class*="backdrop"],[class*="cmp-overlay"],.message-overlay')) {
+        if (!protectedContent(el) && getComputedStyle(el).position === 'fixed') el.remove();
+      }
+    }
+    for (const el of [document.body, document.documentElement]) {
+      if (!el) continue;
+      el.style.overflow = '';
+      el.style.overflowY = '';
+      el.classList.remove('sp-message-open','modal-open','no-scroll','overflow-hidden');
+    }
     return removed;
-  } catch (err) {
-    console.warn('Failed to remove overlays:', err.message);
-    return 0;
+  }, OVERLAY_TEXT_MARKERS);
+}
+
+async function forcePageRepaint(page) {
+  try {
+    await page.evaluate(() => {
+      const scrollX = window.scrollX;
+      const scrollY = window.scrollY;
+      window.scrollTo(scrollX, scrollY + 1);
+      window.scrollTo(scrollX, scrollY);
+
+    });
+    await new Promise(r => setTimeout(r, 250));
+  } catch {
+    // Page may be navigating or detached; repaint is best-effort only.
   }
 }
 
@@ -388,8 +491,12 @@ async function handleConsent(page, url) {
 
   // Layer 3: Shadow DOM handling (Usercentrics etc.) — if not already handled
   if (!consentHandled) {
-    await handleShadowDOMConsent(page);
-    await new Promise(r => setTimeout(r, 500));
+    const shadowHandled = await handleShadowDOMConsent(page);
+    if (shadowHandled) {
+      consentHandled = true;
+      console.log('Consent handled via Shadow DOM');
+      await new Promise(r => setTimeout(r, 1000));
+    }
   }
 
   // Layer 4: Brute-force click-based dismissal
@@ -401,6 +508,13 @@ async function handleConsent(page, url) {
     }
   }
 
+  // Some CMPs render a second confirmation/contentpass layer after the first click.
+  const delayedClick = await clickConsentByTextInFrames(page);
+  if (delayedClick) {
+    consentHandled = true;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
   // Layer 5: Force-remove remaining overlays
   const removed = await removeConsentOverlays(page);
   if (removed > 0) {
@@ -409,6 +523,7 @@ async function handleConsent(page, url) {
 
   // Final wait for page to settle
   await new Promise(r => setTimeout(r, 500));
+  await forcePageRepaint(page);
 
   return consentHandled;
 }
@@ -420,4 +535,5 @@ module.exports = {
   handleShadowDOMConsent,
   clickConsentButtons,
   removeConsentOverlays,
+  forcePageRepaint,
 };

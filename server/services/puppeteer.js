@@ -6,10 +6,13 @@
 const puppeteer = require('puppeteer');
 const sharp = require('sharp');
 const { handleConsent, setConsentCookies } = require('./consent-handler');
+const { FAILURE_CODES } = require('./failure-codes');
+const { injectCreativeIntoDetectedSlot } = require('./placement');
+const { verifyFinalCreative } = require('./image-verification');
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const DESKTOP_VIEWPORT = {
-  width: Number.parseInt(process.env.CAPTURE_VIEWPORT_WIDTH, 10) || (IS_PRODUCTION ? 1366 : 1440),
+  width: Number.parseInt(process.env.CAPTURE_VIEWPORT_WIDTH, 10) || 1366,
   height: Number.parseInt(process.env.CAPTURE_VIEWPORT_HEIGHT, 10) || 900,
 };
 const MOBILE_VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: true };
@@ -19,15 +22,15 @@ const MOBILE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleW
 const MAX_CAPTURE_HEIGHT = Number.parseInt(
   process.env.CAPTURE_MAX_HEIGHT,
   10
-) || (IS_PRODUCTION ? 3400 : 10000);
+) || 3400;
 const DEFAULT_SCROLL_SCAN_PX = Number.parseInt(
   process.env.CAPTURE_MAX_SCROLL_PX,
   10
-) || (IS_PRODUCTION ? 1600 : 8000);
+) || 1600;
 const GENERIC_SLOT_SCAN_LIMIT = Number.parseInt(
   process.env.SLOT_SCAN_LIMIT,
   10
-) || (IS_PRODUCTION ? 900 : 1800);
+) || 900;
 const ADTAG_NAV_TIMEOUT_MS = Number.parseInt(
   process.env.ADTAG_NAV_TIMEOUT_MS,
   10
@@ -46,6 +49,7 @@ const BROWSER_RECYCLE_EVERY = Number.parseInt(
 ) || (IS_PRODUCTION ? 25 : 0);
 
 let browserInstance = null;
+let browserLaunchPromise = null;
 let activeBrowserJobs = 0;
 let completedBrowserJobs = 0;
 
@@ -104,10 +108,22 @@ function isFormatCompatibleSlot(slot, adWidth, adHeight, device) {
   return true;
 }
 
+function summarizeReasons(items = []) {
+  return items.reduce((acc, item) => {
+    const reasons = item.rejectionReasons || item.reasons || [];
+    for (const reason of reasons) {
+      acc[reason] = (acc[reason] || 0) + 1;
+    }
+    return acc;
+  }, {});
+}
+
 async function getBrowser() {
   if (browserInstance && browserInstance.connected) {
     return browserInstance;
   }
+
+  if (browserLaunchPromise) return browserLaunchPromise;
 
   const launchArgs = [
     '--no-sandbox',
@@ -129,18 +145,63 @@ async function getBrowser() {
     launchArgs.push('--single-process');
   }
 
-  browserInstance = await puppeteer.launch({
+  browserLaunchPromise = puppeteer.launch({
     headless: 'new',
     args: launchArgs,
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
     timeout: 30000,
   });
+  try { browserInstance = await browserLaunchPromise; }
+  finally { browserLaunchPromise = null; }
 
   browserInstance.on('disconnected', () => {
     browserInstance = null;
   });
 
   return browserInstance;
+}
+
+async function openBrowserJob(signal) {
+  signal?.throwIfAborted();
+  const browser = await getBrowser();
+  signal?.throwIfAborted();
+  const context = await browser.createBrowserContext();
+  const onAbort = () => { context.close().catch(() => {}); };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+  let page;
+  try { page = await context.newPage(); signal?.throwIfAborted(); }
+  catch (error) { signal?.removeEventListener('abort', onAbort); await context.close().catch(() => {}); throw error; }
+  beginBrowserJob();
+  return { page, async release() {
+    signal?.removeEventListener('abort', onAbort);
+    await context.close().catch(() => {});
+    await endBrowserJob();
+  } };
+}
+
+async function waitForPageAssets(page) {
+  await page.evaluate(async () => {
+    const visibleImages = [...document.images].filter(img => {
+      const rect = img.getBoundingClientRect();
+      return rect.bottom >= 0 && rect.top < innerHeight && rect.width > 0;
+    });
+    await Promise.race([
+      Promise.allSettled([document.fonts.ready, ...visibleImages.map(img => img.decode())]),
+      new Promise(resolve => setTimeout(resolve, 1500)),
+    ]);
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  });
+}
+
+async function readPublisherState(page) {
+  return page.evaluate(() => {
+    const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    const images = [...document.images].filter(img => img.complete && img.naturalWidth > 0).length;
+    const headings = document.querySelectorAll('h1,h2,h3').length;
+    const challenge = text.length < 1500 && /access denied|verify you are human|checking your browser|just a moment|enable javascript and cookies/i.test(text);
+    return { textLength: text.length, images, headings, usable: !challenge && (text.length >= 120 || (headings > 0 && images > 0)) };
+  });
 }
 
 function beginBrowserJob() {
@@ -167,24 +228,46 @@ async function endBrowserJob() {
  * Detect existing ad slots/iframes and return ranked candidates.
  */
 async function detectAdSlots(page, targetWidth, targetHeight, device, options = {}) {
-  const maxCandidateY = options.maxCandidateY || (device === 'mobile' ? 2800 : (IS_PRODUCTION ? 3200 : 4200));
+  const maxCandidateY = options.maxCandidateY || Math.min(MAX_CAPTURE_HEIGHT - targetHeight - 40, device === 'mobile' ? 2800 : 3200);
   const scanLimit = options.scanLimit || GENERIC_SLOT_SCAN_LIMIT;
   const slots = await page.evaluate((tw, th, maxScanned) => {
     const results = [];
     const slotIds = new WeakMap();
-    let slotCounter = 0;
-
+    window.__adframeSlotOwners ||= new Map();
     const getSlotId = (el) => {
       if (slotIds.has(el)) return slotIds.get(el);
-      const existing = el.getAttribute('data-adframe-slot-id');
-      if (existing) {
-        slotIds.set(el, existing);
-        return existing;
+      let id = el.getAttribute('data-adframe-slot-id');
+      if (!id || (window.__adframeSlotOwners.has(id) && window.__adframeSlotOwners.get(id) !== el)) {
+        if (el.id && document.querySelectorAll(`#${CSS.escape(el.id)}`).length === 1) {
+          id = `adf-id-${encodeURIComponent(el.id)}`;
+        } else {
+          const path = [];
+          let node = el;
+          while (node && node !== document.body) {
+            const siblings = [...node.parentElement.children].filter(child => child.tagName === node.tagName);
+            path.unshift(`${node.tagName.toLowerCase()}:${siblings.indexOf(node) + 1}`);
+            node = node.parentElement;
+          }
+          id = `adf-path-${path.join('/')}`;
+        }
+        while (window.__adframeSlotOwners.has(id) && window.__adframeSlotOwners.get(id) !== el) id += '-new';
+        el.setAttribute('data-adframe-slot-id', id);
       }
-      const newId = `adf-slot-${++slotCounter}`;
-      el.setAttribute('data-adframe-slot-id', newId);
-      slotIds.set(el, newId);
-      return newId;
+      window.__adframeSlotOwners.set(id, el);
+      slotIds.set(el, id);
+      return id;
+    };
+    const adToken = /(?:^|[\s_-])(?:ads?|advert(?:isement|ising)?|gpt|banner|sponsor(?:ed)?|billboard|leaderboard|skyscraper|rectangle|adslot|iqadtile|adtile)(?:$|[\s_-]|\d)/i;
+    const hasAdEvidence = el => {
+      if (el.matches('[data-ad], [data-ad-slot], [data-google-query-id]')) return true;
+      if (adToken.test(`${el.id || ''} ${String(el.className || '')}`)) return true;
+      if (el.tagName === 'IFRAME') {
+        try {
+          const host = new URL(el.src || el.dataset.src, location.href).hostname;
+          return /(^|\.)(doubleclick\.net|googlesyndication\.com|amazon-adsystem\.com|flashtalking\.com|adform\.net|adition\.com)$/.test(host);
+        } catch { return false; }
+      }
+      return [...el.querySelectorAll('iframe')].some(frame => hasAdEvidence(frame));
     };
 
     const isVisible = (el, rect) => {
@@ -237,7 +320,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       const isFixedOrSticky = style.position === 'fixed' || style.position === 'sticky';
       const iframeCount = (el.tagName === 'IFRAME' ? 1 : 0) + el.querySelectorAll('iframe').length;
       const visualChildCount = iframeCount + el.querySelectorAll('img, picture, svg, canvas, video').length;
-      const hasAdHints = /(ad|gpt|advert|banner|sponsor|billboard|leaderboard|skyscraper|rectangle|slot|promo)/.test(signature);
+      const hasAdHints = hasAdEvidence(el);
       const looksLikePlaceholder = textLength < 40 && headingCount === 0 && paragraphCount === 0 && visualChildCount <= 1;
 
       results.push({
@@ -270,15 +353,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
     const iframes = document.querySelectorAll('iframe');
     for (const iframe of iframes) {
       const rect = iframe.getBoundingClientRect();
-      const src = (iframe.src || iframe.dataset.src || '').toLowerCase();
-      const id = (iframe.id || '').toLowerCase();
-      const cls = (iframe.className || '').toLowerCase();
-      const isAdLikely = src.includes('ad') || src.includes('doubleclick') ||
-        src.includes('googlesyndication') || src.includes('amazon-adsystem') ||
-        src.includes('flashtalking') || src.includes('adform') ||
-        src.includes('adition') || id.includes('ad') || cls.includes('ad') ||
-        id.includes('banner') || cls.includes('banner') ||
-        id.includes('gpt') || cls.includes('gpt');
+      const isAdLikely = hasAdEvidence(iframe);
       pushSlot(iframe, rect, 'iframe', isAdLikely);
     }
 
@@ -300,7 +375,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
         const els = document.querySelectorAll(sel);
         for (const el of els) {
           const rect = el.getBoundingClientRect();
-          pushSlot(el, rect, 'div', true);
+          pushSlot(el, rect, 'div', hasAdEvidence(el));
         }
       } catch (e) {
         // Ignore invalid selectors.
@@ -327,13 +402,7 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       const heightClose = Math.abs(rect.height - th) <= Math.max(80, th * 0.35);
       if (!widthClose || !heightClose) continue;
 
-      const id = (el.id || '').toLowerCase();
-      const cls = (el.className || '').toLowerCase();
-      const hasAdHints = id.includes('ad') || cls.includes('ad') ||
-        id.includes('banner') || cls.includes('banner') ||
-        id.includes('gpt') || cls.includes('gpt') ||
-        id.includes('sponsor') || cls.includes('sponsor') ||
-        el.querySelector('iframe');
+      const hasAdHints = hasAdEvidence(el);
 
       const text = ((el.textContent || '') + '').replace(/\s+/g, ' ').trim();
       const hasContentSignals =
@@ -505,17 +574,25 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
     }
 
     const roundedScore = Math.round(score);
-    const structuralReject = !s.isAd && (
+    const structuralReject = (
       s.insideHeader ||
       s.isFixedOrSticky ||
       s.hasStickyAncestor ||
-      (s.insideArticle && s.textLength > 120 && !s.hasAdHints)
+      (s.hasArticleSignals || s.headingCount > 0 || s.paragraphCount > 0 || (!s.isAd && s.insideArticle))
     );
-    const dimensionReject = hasHardSizeMismatch || isOversizedContainer;
+    const dimensionReject = hasHardSizeMismatch || isOversizedContainer || s.width < targetWidth - 1 || s.height < targetHeight - 1;
 
     let confidence = 'low';
     if (roundedScore >= 105) confidence = 'high';
     else if (roundedScore >= 85) confidence = 'medium';
+
+    const rejectionReasons = [];
+    if (roundedScore < 65) rejectionReasons.push('low-score');
+    if (!s.isAd && s.type !== 'iframe' && s.type !== 'gpt') rejectionReasons.push('weak-ad-evidence');
+    if (!isFormatCompatibleSlot(s, targetWidth, targetHeight, device)) rejectionReasons.push('format-incompatible');
+    if (structuralReject) rejectionReasons.push('unsafe-structure');
+    if (dimensionReject) rejectionReasons.push('dimension-reject');
+    if (s.y < 0 || s.y > maxCandidateY) rejectionReasons.push('outside-capture-range');
 
     return {
       ...s,
@@ -524,13 +601,27 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
       structuralReject,
       dimensionReject,
       reasons,
+      rejectionReasons,
     };
   });
 
   scored.sort((a, b) => b.score - a.score);
+  const rejectedCandidates = scored
+    .filter((c) => c.rejectionReasons.length > 0)
+    .slice(0, 12)
+    .map((c) => ({
+      slotId: c.slotId,
+      score: c.score,
+      type: c.type,
+      x: Math.round(c.x),
+      y: Math.round(c.y),
+      slotWidth: Math.round(c.width),
+      slotHeight: Math.round(c.height),
+      reasons: c.rejectionReasons,
+    }));
   const candidates = scored
     .filter((c) => c.score >= 65)
-    .filter((c) => c.isAd || c.type === 'iframe' || c.type === 'gpt')
+    .filter((c) => c.isAd)
     .filter((c) => isFormatCompatibleSlot(c, targetWidth, targetHeight, device))
     .filter((c) => !c.structuralReject)
     .filter((c) => !c.dimensionReject)
@@ -562,31 +653,16 @@ async function detectAdSlots(page, targetWidth, targetHeight, device, options = 
   }
 
   if (options.returnCandidates) {
-    return { bestSlot: best, candidates };
+    return {
+      bestSlot: best,
+      candidates,
+      rejectedCandidates,
+      rejectionSummary: summarizeReasons(rejectedCandidates),
+      weakBestScore: scored[0]?.score ?? null,
+    };
   }
 
   return best;
-}
-
-function buildDataUri(imageBuffer, mimeType = 'image/png') {
-  return `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
-}
-
-function buildAdTagSrcDoc(adTag, width, height) {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: ${width}px; height: ${height}px; overflow: hidden; background: #fff; }
-    #adframe-slot { width: 100%; height: 100%; overflow: hidden; }
-  </style>
-</head>
-<body>
-  <div id="adframe-slot">${adTag}</div>
-</body>
-</html>`;
 }
 
 function buildWrappedAdHtml(adTag, width, height) {
@@ -698,28 +774,6 @@ async function analyzeImageUniformity(imageBuffer) {
   };
 }
 
-async function compareClipDifference(beforeBuffer, afterBuffer) {
-  const [before, after] = await Promise.all([
-    sharp(beforeBuffer).resize(48, 48, { fit: 'fill' }).removeAlpha().raw().toBuffer({ resolveWithObject: true }),
-    sharp(afterBuffer).resize(48, 48, { fit: 'fill' }).removeAlpha().raw().toBuffer({ resolveWithObject: true }),
-  ]);
-
-  const channels = before.info.channels || 3;
-  let changed = 0;
-  let pixels = 0;
-
-  for (let index = 0; index < before.data.length; index += channels) {
-    const delta =
-      Math.abs(before.data[index] - after.data[index]) +
-      Math.abs(before.data[index + 1] - after.data[index + 1]) +
-      Math.abs(before.data[index + 2] - after.data[index + 2]);
-    if (delta > 48) changed++;
-    pixels++;
-  }
-
-  return pixels > 0 ? changed / pixels : 0;
-}
-
 async function getCreativeDomState(page) {
   return page.evaluate(() => {
     const nodes = [...document.querySelectorAll('img, canvas, video, svg, iframe, div, ins')];
@@ -733,7 +787,7 @@ async function getCreativeDomState(page) {
       domNodeCount: document.querySelectorAll('*').length,
       visibleRenderableNodes: visibleRenderableNodes.length,
       iframeCount: document.querySelectorAll('iframe').length,
-      imageCount: document.querySelectorAll('img, svg, canvas, video').length,
+      imageCount: [...document.images].filter(img => img.complete && img.naturalWidth > 0).length + document.querySelectorAll('svg,canvas').length,
       textLength: ((document.body?.innerText || '') + '').replace(/\s+/g, ' ').trim().length,
     };
   });
@@ -741,12 +795,7 @@ async function getCreativeDomState(page) {
 
 async function waitForCreativeRender(page, width, height, diagnostics) {
   const deadline = Date.now() + ADTAG_RENDER_MAX_WAIT_MS;
-  const centerClip = {
-    x: Math.max(0, Math.floor(width / 2) - 25),
-    y: Math.max(0, Math.floor(height / 2) - 25),
-    width: Math.min(50, width),
-    height: Math.min(50, height),
-  };
+  const centerClip = { x: 0, y: 0, width, height };
 
   while (Date.now() <= deadline) {
     const domState = await getCreativeDomState(page);
@@ -787,63 +836,6 @@ async function waitForCreativeRender(page, width, height, diagnostics) {
   };
 }
 
-async function getSlotVisualState(page, slotId, maxCaptureHeight) {
-  return page.evaluate((candidateSlotId, clipHeight) => {
-    const slotEl = document.querySelector(`[data-adframe-slot-id="${candidateSlotId}"]`);
-    if (!slotEl) {
-      return { visible: false, reason: 'slot-not-found' };
-    }
-
-    const rect = slotEl.getBoundingClientRect();
-    const style = getComputedStyle(slotEl);
-    const opacity = parseFloat(style.opacity || '1');
-    const zIndexValue = Number.parseInt(style.zIndex, 10);
-    const zIndex = Number.isFinite(zIndexValue) ? zIndexValue : 0;
-    const absoluteTop = rect.top + window.scrollY;
-    const absoluteLeft = rect.left + window.scrollX;
-
-    if (rect.width < 20 || rect.height < 20) {
-      return { visible: false, reason: 'slot-too-small' };
-    }
-    if (style.display === 'none' || style.visibility === 'hidden' || opacity <= 0.1) {
-      return { visible: false, reason: 'slot-hidden' };
-    }
-    if (zIndex < 0) {
-      return { visible: false, reason: 'slot-behind-content' };
-    }
-    if (absoluteTop >= clipHeight) {
-      return { visible: false, reason: 'slot-outside-capture' };
-    }
-
-    let clippedByAncestor = false;
-    let ancestor = slotEl.parentElement;
-    while (ancestor) {
-      const ancestorStyle = getComputedStyle(ancestor);
-      if (ancestorStyle.overflow === 'hidden' || ancestorStyle.overflowY === 'hidden' || ancestorStyle.overflowX === 'hidden') {
-        const ancestorRect = ancestor.getBoundingClientRect();
-        if (rect.bottom > ancestorRect.bottom + 1 || rect.right > ancestorRect.right + 1) {
-          clippedByAncestor = true;
-          break;
-        }
-      }
-      ancestor = ancestor.parentElement;
-    }
-
-    if (clippedByAncestor) {
-      return { visible: false, reason: 'slot-clipped' };
-    }
-
-    return {
-      visible: true,
-      x: Math.max(0, Math.round(absoluteLeft)),
-      y: Math.max(0, Math.round(absoluteTop)),
-      width: Math.max(1, Math.round(rect.width)),
-      height: Math.max(1, Math.round(rect.height)),
-      isIframe: slotEl.tagName === 'IFRAME',
-    };
-  }, slotId, maxCaptureHeight);
-}
-
 function buildPageScreenshotOptions(rawDimensions, viewport, referenceY, referenceHeight, maxCaptureHeight = MAX_CAPTURE_HEIGHT) {
   const desiredBottom = Math.max(
     rawDimensions.viewportHeight + 100,
@@ -879,10 +871,41 @@ function isRetryableNetworkError(err) {
   return /ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_REFUSED|ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET|ERR_ABORTED|ERR_TUNNEL_CONNECTION_FAILED/i.test(message);
 }
 
+function getErrorCode(err) {
+  const message = err?.message || '';
+  if (isTimeoutError(err)) return FAILURE_CODES.MOCKUP_TIMEOUT;
+  if (isSslError(err)) return FAILURE_CODES.SSL_ERROR;
+  if (isRetryableNetworkError(err)) return FAILURE_CODES.CAPTURE_NAVIGATION_FAILED;
+  return err?.code || FAILURE_CODES.UNKNOWN;
+}
+
+function createCaptureDiagnostics(url, device, adWidth, adHeight) {
+  const startedAt = Date.now();
+  return {
+    requestedUrl: url,
+    device,
+    adSize: `${adWidth}x${adHeight}`,
+    startedAt: new Date(startedAt).toISOString(),
+    timingsMs: {},
+    navigationAttempts: [],
+    consent: null,
+    slotDetection: null,
+    dimensions: null,
+    screenshot: null,
+    domInjection: null,
+  };
+}
+
+function finishTiming(diagnostics, key, startedAt) {
+  if (!diagnostics?.timingsMs) return;
+  diagnostics.timingsMs[key] = Date.now() - startedAt;
+}
+
 function buildNavigationCandidates(initialUrl) {
   try {
     const parsed = new URL(initialUrl);
     const hostname = parsed.hostname;
+    if (hostname === 'localhost' || hostname.includes(':') || /^\d+\.\d+\.\d+\.\d+$/.test(hostname)) return [initialUrl];
     const bareHost = hostname.replace(/^www\./i, '');
     const hostWithWww = bareHost.startsWith('www.') ? bareHost : `www.${bareHost}`;
     const protocol = parsed.protocol === 'http:' ? 'http:' : 'https:';
@@ -892,7 +915,7 @@ function buildNavigationCandidates(initialUrl) {
 
     const pushUrl = (proto, host) => {
       if (!host) return;
-      const value = `${proto}//${host}${basePath}`;
+      const value = `${proto}//${host}${parsed.port ? `:${parsed.port}` : ''}${basePath}`;
       if (!candidates.includes(value)) candidates.push(value);
     };
 
@@ -914,275 +937,53 @@ function buildNavigationCandidates(initialUrl) {
 }
 
 async function navigatePage(page, url) {
-  if (IS_PRODUCTION) {
-    await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 22000,
-    });
-    await new Promise(r => setTimeout(r, 1200));
-    return page.url();
+  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 22000 });
+  if (response && response.status() >= 400) {
+    const error = new Error(`Publisher returned HTTP ${response.status()}`);
+    error.code = FAILURE_CODES.CAPTURE_NAVIGATION_FAILED;
+    throw error;
   }
-
-  try {
-    await page.goto(url, {
-      waitUntil: 'networkidle2',
-      timeout: 25000,
-    });
-    return page.url();
-  } catch (err) {
-    if (!isTimeoutError(err)) throw err;
-    console.warn(`Primary navigation timed out for ${url}, retrying with domcontentloaded`);
-    await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 20000,
-    });
-    await new Promise(r => setTimeout(r, 1500));
-    return page.url();
-  }
+  await waitForPageAssets(page);
+  return page.url();
 }
 
-async function navigateWithFallbacks(page, initialUrl) {
+async function navigateWithFallbacks(page, initialUrl, diagnostics = null) {
   const candidates = buildNavigationCandidates(initialUrl);
   let lastError = null;
 
   for (const candidateUrl of candidates) {
+    const attempt = {
+      url: candidateUrl,
+      startedAt: new Date().toISOString(),
+    };
+    const startedAt = Date.now();
     try {
       await setConsentCookies(page, candidateUrl);
       const finalUrl = await navigatePage(page, candidateUrl);
+      attempt.status = 'ok';
+      attempt.finalUrl = finalUrl;
+      attempt.durationMs = Date.now() - startedAt;
+      diagnostics?.navigationAttempts?.push(attempt);
       return finalUrl;
     } catch (err) {
       lastError = err;
+      attempt.status = 'failed';
+      attempt.failureCode = getErrorCode(err);
+      attempt.message = err?.message || String(err);
+      attempt.durationMs = Date.now() - startedAt;
+      diagnostics?.navigationAttempts?.push(attempt);
       const canRetry = candidateUrl !== candidates[candidates.length - 1];
       if ((isSslError(err) || isRetryableNetworkError(err) || isTimeoutError(err)) && canRetry) {
         continue;
       }
+      err.code = err.code || FAILURE_CODES.CAPTURE_NAVIGATION_FAILED;
       throw err;
     }
   }
 
-  throw lastError || new Error(`Failed to navigate to ${initialUrl}`);
-}
-
-async function injectCreativeIntoDetectedSlot(
-  page,
-  detectedSlot,
-  { adTag = null, adImageBuffer = null, adWidth = 300, adHeight = 250, device = 'desktop', slotCandidates = null, captureHeightLimit = MAX_CAPTURE_HEIGHT } = {}
-) {
-  const mode = adImageBuffer ? 'image' : adTag ? 'adtag' : null;
-  if (!mode) {
-    return { succeeded: false, reason: 'no-creative' };
-  }
-
-  const candidates = Array.isArray(slotCandidates) && slotCandidates.length > 0
-    ? slotCandidates
-    : detectedSlot ? [detectedSlot] : [];
-
-  if (candidates.length === 0) {
-    return { succeeded: false, reason: 'no-slot' };
-  }
-
-  const eligible = candidates
-    .filter((c) => c?.slotId)
-    .filter((c) => c.isAd || c.type === 'iframe' || c.type === 'gpt')
-    .filter((c) => (c.slotWidth || 0) >= Math.max(120, adWidth * 0.55))
-    .filter((c) => (c.slotHeight || 0) >= Math.max(60, adHeight * 0.5))
-    .filter((c) => (c.y || 0) + Math.max(40, Math.min(c.slotHeight || adHeight, adHeight)) <= captureHeightLimit - 40)
-    .filter((c) => isFormatCompatibleSlot(c, adWidth, adHeight, device))
-    .slice(0, IS_PRODUCTION ? 3 : 5);
-
-  if (eligible.length === 0) {
-    return { succeeded: false, reason: 'no-eligible-slot' };
-  }
-
-  const sharedPayload = {
-    mode,
-    adWidth,
-    adHeight,
-    imageDataUrl: adImageBuffer ? buildDataUri(adImageBuffer) : null,
-    srcdoc: adTag ? buildAdTagSrcDoc(adTag, adWidth, adHeight) : null,
-  };
-
-  for (let index = 0; index < eligible.length; index++) {
-    const candidate = eligible[index];
-    const visualState = await getSlotVisualState(page, candidate.slotId, captureHeightLimit);
-    if (!visualState.visible) {
-      continue;
-    }
-
-    const preScreenshot = visualState.isIframe
-      ? null
-      : await captureClipBuffer(page, {
-          x: visualState.x,
-          y: visualState.y,
-          width: visualState.width,
-          height: visualState.height,
-        });
-
-    const payload = {
-      ...sharedPayload,
-      slotId: candidate.slotId,
-      fallbackWidth: candidate.slotWidth || adWidth,
-      fallbackHeight: candidate.slotHeight || adHeight,
-    };
-
-    const result = await page.evaluate((p) => {
-      const slotEl = document.querySelector(`[data-adframe-slot-id="${p.slotId}"]`);
-      if (!slotEl) {
-        return { succeeded: false, reason: 'slot-not-found' };
-      }
-
-      let hostEl = slotEl;
-      if (slotEl.tagName === 'IFRAME') {
-        const rect = slotEl.getBoundingClientRect();
-        const replacement = document.createElement('div');
-        replacement.setAttribute('data-adframe-slot-id', p.slotId);
-        replacement.style.width = `${Math.max(1, Math.round(rect.width || p.fallbackWidth))}px`;
-        replacement.style.height = `${Math.max(1, Math.round(rect.height || p.fallbackHeight))}px`;
-        replacement.style.display = 'block';
-        replacement.style.overflow = 'hidden';
-        slotEl.replaceWith(replacement);
-        hostEl = replacement;
-      }
-
-      const rectBefore = hostEl.getBoundingClientRect();
-      const styleBefore = getComputedStyle(hostEl);
-      if (styleBefore.display === 'none' || styleBefore.visibility === 'hidden' || rectBefore.width < 20 || rectBefore.height < 20) {
-        return { succeeded: false, reason: 'slot-not-visible' };
-      }
-
-      const signature = `${hostEl.id || ''} ${hostEl.className || ''}`.toLowerCase();
-      const adLike = /(ad|gpt|banner|sponsor|billboard|rectangle|skyscraper|iqadtile|adtile)/.test(signature);
-      const text = ((hostEl.textContent || '') + '').replace(/\s+/g, ' ').trim();
-      const hasEditorialSignals =
-        text.length > 160 ||
-        Boolean(hostEl.querySelector('h1, h2, h3, h4, p, article, time')) ||
-        hostEl.matches('article, main, [role="main"]') ||
-        Boolean(hostEl.closest('article, main, [role="main"]'));
-      if (hasEditorialSignals && !adLike) {
-        return { succeeded: false, reason: 'content-like-slot' };
-      }
-
-      // Lock explicit dimensions before clearing children so the slot
-      // does not collapse when its content-derived height is removed.
-      hostEl.style.width = `${Math.max(1, Math.round(rectBefore.width || p.fallbackWidth))}px`;
-      hostEl.style.height = `${Math.max(1, Math.round(rectBefore.height || p.fallbackHeight))}px`;
-
-      while (hostEl.firstChild) {
-        hostEl.removeChild(hostEl.firstChild);
-      }
-
-      if (styleBefore.position === 'static') {
-        hostEl.style.position = 'relative';
-      }
-      hostEl.style.overflow = 'hidden';
-
-      const creative = document.createElement('div');
-      creative.style.width = '100%';
-      creative.style.height = '100%';
-      creative.style.background = 'transparent';
-      creative.setAttribute('data-adframe-injected', 'true');
-
-      if (p.mode === 'image') {
-        const img = document.createElement('img');
-        img.src = p.imageDataUrl;
-        img.alt = 'Ad creative';
-        img.style.width = '100%';
-        img.style.height = '100%';
-        img.style.display = 'block';
-        img.style.objectFit = 'fill';
-        creative.appendChild(img);
-      } else {
-        const iframe = document.createElement('iframe');
-        iframe.srcdoc = p.srcdoc;
-        iframe.setAttribute('scrolling', 'no');
-        iframe.setAttribute('frameborder', '0');
-        iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox');
-        iframe.setAttribute('data-adframe-injected', 'true');
-        iframe.style.width = '100%';
-        iframe.style.height = '100%';
-        iframe.style.border = '0';
-        iframe.style.display = 'block';
-        creative.appendChild(iframe);
-      }
-
-      hostEl.appendChild(creative);
-
-      const rectAfter = hostEl.getBoundingClientRect();
-      return {
-        succeeded: true,
-        mode: p.mode,
-        x: Math.round(rectAfter.left + window.scrollX),
-        y: Math.round(rectAfter.top + window.scrollY),
-        slotWidth: Math.round(rectAfter.width),
-        slotHeight: Math.round(rectAfter.height),
-      };
-    }, payload);
-
-    if (!result?.succeeded) {
-      continue;
-    }
-
-    if (mode === 'adtag') {
-      await page.evaluate((slotId) => {
-        return new Promise((resolve) => {
-          const host = document.querySelector(`[data-adframe-slot-id="${slotId}"]`);
-          const iframe = host?.querySelector('iframe[data-adframe-injected="true"]');
-          if (!iframe) {
-            resolve(false);
-            return;
-          }
-          let settled = false;
-          const done = () => {
-            if (settled) return;
-            settled = true;
-            resolve(true);
-          };
-          iframe.addEventListener('load', done, { once: true });
-          setTimeout(done, 3000);
-        });
-      }, candidate.slotId);
-    }
-
-    await new Promise((r) => setTimeout(r, mode === 'adtag' ? 1200 : 350));
-
-    const postVisualState = await getSlotVisualState(page, candidate.slotId, captureHeightLimit);
-    if (!postVisualState.visible) {
-      continue;
-    }
-
-    const postScreenshot = await captureClipBuffer(page, {
-      x: postVisualState.x,
-      y: postVisualState.y,
-      width: postVisualState.width,
-      height: postVisualState.height,
-    });
-    const postUniformity = await analyzeImageUniformity(postScreenshot);
-    let changedRatio = 1;
-
-    if (preScreenshot) {
-      changedRatio = await compareClipDifference(preScreenshot, postScreenshot);
-      if (changedRatio < 0.15) {
-        continue;
-      }
-    }
-
-    if (postUniformity.nearWhite && mode !== 'image') {
-      continue;
-    }
-
-    return {
-      ...result,
-      succeeded: true,
-      selectedSlotId: candidate.slotId,
-      selectedSlotScore: candidate.score,
-      selectedSlotType: candidate.type,
-      attempts: index + 1,
-      visuallyVerified: true,
-      visualDiffRatio: Number(changedRatio.toFixed(3)),
-    };
-  }
-
-  return { succeeded: false, reason: 'all-candidates-failed' };
+  const error = lastError || new Error(`Failed to navigate to ${initialUrl}`);
+  error.code = error.code || FAILURE_CODES.CAPTURE_NAVIGATION_FAILED;
+  throw error;
 }
 
 /**
@@ -1197,9 +998,10 @@ async function captureWebsite(
   onProgress = () => {},
   injectionOptions = null
 ) {
-  const browser = await getBrowser();
-  beginBrowserJob();
-  const page = await browser.newPage();
+  const signal = injectionOptions?.signal;
+  const job = await openBrowserJob(signal);
+  const { page } = job;
+  const diagnostics = createCaptureDiagnostics(url, device, adWidth, adHeight);
 
   try {
     const viewport = device === 'mobile' ? MOBILE_VIEWPORT : DESKTOP_VIEWPORT;
@@ -1213,7 +1015,7 @@ async function captureWebsite(
     await page.setRequestInterception(true);
     page.on('request', req => {
       const type = req.resourceType();
-      if (['media', 'font'].includes(type)) {
+      if (type === 'media') {
         req.abort();
       } else {
         req.continue();
@@ -1222,21 +1024,37 @@ async function captureWebsite(
 
     onProgress('Loading page...');
 
-    const finalUrl = await navigateWithFallbacks(page, url);
+    let phaseStartedAt = Date.now();
+    const finalUrl = await navigateWithFallbacks(page, url, diagnostics);
+    finishTiming(diagnostics, 'navigation', phaseStartedAt);
 
     onProgress('Handling consent banners...');
 
+    phaseStartedAt = Date.now();
+    const beforeConsent = await readPublisherState(page);
     const consentHandled = await handleConsent(page, finalUrl);
+    const pageState = await readPublisherState(page);
+    if (!pageState.usable || (beforeConsent.textLength > 500 && pageState.textLength < beforeConsent.textLength * 0.1)) {
+      const error = new Error('The publisher page is empty or blocked after consent handling. Try another publisher.');
+      error.code = FAILURE_CODES.CAPTURE_CONTENT_MISSING;
+      throw error;
+    }
+    diagnostics.pageState = pageState;
+    diagnostics.consent = { handled: Boolean(consentHandled), contentRetained: pageState.usable };
+    finishTiming(diagnostics, 'consent', phaseStartedAt);
 
     onProgress('Scrolling page...');
 
     // Limit scroll depth in production to avoid loading very long pages into memory.
+    phaseStartedAt = Date.now();
     await autoScroll(page, DEFAULT_SCROLL_SCAN_PX);
     await page.evaluate(() => window.scrollTo(0, 0));
-    await new Promise(r => setTimeout(r, 1000));
+    await waitForPageAssets(page);
+    finishTiming(diagnostics, 'scroll', phaseStartedAt);
 
     onProgress('Detecting ad positions...');
 
+    phaseStartedAt = Date.now();
     let slotDetection = await detectAdSlots(page, adWidth, adHeight, device, { returnCandidates: true });
 
     // Second pass deeper in-page when top-of-page pass finds no suitable slot.
@@ -1259,12 +1077,29 @@ async function captureWebsite(
         slotDetection = {
           bestSlot: secondPass.bestSlot,
           candidates: [...deduped.values()].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8),
+          rejectedCandidates: [
+            ...(slotDetection.rejectedCandidates || []),
+            ...(secondPass.rejectedCandidates || []),
+          ].slice(0, 12),
+          rejectionSummary: summarizeReasons([
+            ...(slotDetection.rejectedCandidates || []),
+            ...(secondPass.rejectedCandidates || []),
+          ]),
+          weakBestScore: Math.max(slotDetection.weakBestScore || 0, secondPass.weakBestScore || 0),
         };
       }
     }
 
     let detectedSlot = slotDetection.bestSlot;
     let slotCandidates = slotDetection.candidates || [];
+    diagnostics.slotDetection = {
+      bestSlotId: detectedSlot?.slotId || null,
+      candidateCount: slotCandidates.length,
+      rejectedCount: slotDetection.rejectedCandidates?.length || 0,
+      rejectionSummary: slotDetection.rejectionSummary || {},
+      weakBestScore: slotDetection.weakBestScore ?? null,
+    };
+    finishTiming(diagnostics, 'slotDetection', phaseStartedAt);
 
     if (injectionOptions?.slotId && slotCandidates.length > 0) {
       const selectedCandidate = slotCandidates.find((candidate) => candidate.slotId === injectionOptions.slotId);
@@ -1276,11 +1111,12 @@ async function captureWebsite(
         ];
       }
     }
-    const rawDimensions = await page.evaluate(() => ({
+    let rawDimensions = await page.evaluate(() => ({
       width: document.documentElement.scrollWidth,
       height: document.documentElement.scrollHeight,
       viewportHeight: window.innerHeight,
     }));
+    diagnostics.dimensions = { ...rawDimensions };
     let domInjection = { succeeded: false, reason: 'not-attempted' };
     let preparedCreative = injectionOptions
       ? {
@@ -1301,7 +1137,14 @@ async function captureWebsite(
       const effectiveOptions = { ...injectionOptions };
       if (effectiveOptions.adTag && !effectiveOptions.adImageBuffer) {
         onProgress('Rendering ad tag...');
-        const renderedCreative = await renderAdTag(effectiveOptions.adTag, adWidth, adHeight);
+        phaseStartedAt = Date.now();
+        const renderedCreative = await renderAdTag(effectiveOptions.adTag, adWidth, adHeight, { signal });
+        if (!renderedCreative?.imageBuffer || renderedCreative.renderConfidence !== 'high') {
+          const error = new Error('The ad tag did not produce a verifiable creative. Upload an image or try a different tag.');
+          error.code = FAILURE_CODES.ADTAG_RENDER_FAILED;
+          throw error;
+        }
+        finishTiming(diagnostics, 'adTagRender', phaseStartedAt);
         if (renderedCreative?.imageBuffer) {
           effectiveOptions.adImageBuffer = renderedCreative.imageBuffer;
           effectiveOptions.adTag = null;
@@ -1330,6 +1173,7 @@ async function captureWebsite(
       }
 
       onProgress('Injecting ad creative...');
+      phaseStartedAt = Date.now();
       domInjection = await injectCreativeIntoDetectedSlot(page, detectedSlot, {
         ...effectiveOptions,
         adWidth,
@@ -1337,10 +1181,40 @@ async function captureWebsite(
         device,
         slotCandidates,
         captureHeightLimit,
+        selectedSlotId: injectionOptions.slotId,
+        signal,
       });
+      diagnostics.domInjection = {
+        succeeded: Boolean(domInjection.succeeded),
+        reason: domInjection.reason || null,
+        attempts: domInjection.attempts || 0,
+        selectedSlotId: domInjection.selectedSlotId || null,
+        rejectedCandidates: domInjection.rejectedCandidates || [],
+        rejectionSummary: domInjection.rejectionSummary || summarizeReasons(domInjection.rejectedCandidates || []),
+      };
+      finishTiming(diagnostics, 'domInjection', phaseStartedAt);
     }
 
+    signal?.throwIfAborted();
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await waitForPageAssets(page);
+    rawDimensions = await page.evaluate(() => ({ width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight, viewportHeight: innerHeight }));
+    if (domInjection.succeeded) {
+      const finalPosition = await page.evaluate(id => {
+        const creative = document.querySelector(`[data-adframe-slot-id="${CSS.escape(id)}"] [data-adframe-creative]`);
+        if (!creative) return null;
+        const rect = creative.getBoundingClientRect();
+        return { x: Math.round(rect.left + scrollX), y: Math.round(rect.top + scrollY), width: Math.round(rect.width), height: Math.round(rect.height) };
+      }, domInjection.selectedSlotId);
+      if (!finalPosition || finalPosition.width !== adWidth || finalPosition.height !== adHeight) {
+        const error = new Error('The publisher changed the creative placement during capture. Try another publisher.');
+        error.code = FAILURE_CODES.OUTPUT_QUALITY_FAILED;
+        throw error;
+      }
+      Object.assign(domInjection, finalPosition);
+    }
     onProgress('Taking screenshot...');
+    phaseStartedAt = Date.now();
 
     const referenceY = domInjection.succeeded
       ? domInjection.y
@@ -1357,6 +1231,17 @@ async function captureWebsite(
       captureHeightLimit
     );
     const screenshot = await page.screenshot(screenshotOptions);
+    if (domInjection.succeeded) {
+      const verification = await verifyFinalCreative(Buffer.from(screenshot), preparedCreative.adImageBuffer, domInjection, adWidth, adHeight);
+      diagnostics.finalCreativeVerification = verification;
+      if (!verification.passed) {
+        const error = new Error('The creative is not fully visible in the final screenshot. Try another placement or publisher.');
+        error.code = FAILURE_CODES.OUTPUT_QUALITY_FAILED;
+        throw error;
+      }
+    }
+    signal?.throwIfAborted();
+    finishTiming(diagnostics, 'screenshot', phaseStartedAt);
 
     const dimensions = {
       ...rawDimensions,
@@ -1365,6 +1250,15 @@ async function captureWebsite(
       truncated: screenshotOptions.clip.height < rawDimensions.height,
       viewportCropped: true,
     };
+    diagnostics.screenshot = {
+      width: screenshotOptions.clip.width,
+      height: screenshotOptions.clip.height,
+      truncated: dimensions.truncated,
+      referenceY,
+      referenceHeight,
+    };
+    diagnostics.finishedAt = new Date().toISOString();
+    diagnostics.durationMs = Date.now() - Date.parse(diagnostics.startedAt);
 
     return {
       screenshot: Buffer.from(screenshot),
@@ -1376,14 +1270,146 @@ async function captureWebsite(
       slotCandidates,
       domInjection,
       preparedCreative,
+      diagnostics,
     };
   } finally {
-    try {
-      await page.close();
-    } catch (err) {
-      console.warn('Failed to close capture page cleanly:', err?.message || err);
+    await job.release();
+  }
+}
+
+async function probeWebsiteAdSlots(
+  url,
+  device = 'desktop',
+  adWidth = 300,
+  adHeight = 250,
+  { signal } = {}
+) {
+  const job = await openBrowserJob(signal);
+  const { page } = job;
+  const diagnostics = createCaptureDiagnostics(url, device, adWidth, adHeight);
+
+  try {
+    const viewport = device === 'mobile' ? MOBILE_VIEWPORT : DESKTOP_VIEWPORT;
+    const ua = device === 'mobile' ? MOBILE_UA : DESKTOP_UA;
+
+    await page.setViewport(viewport);
+    await page.setUserAgent(ua);
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const type = req.resourceType();
+      if (type === 'media') {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    let phaseStartedAt = Date.now();
+    const finalUrl = await navigateWithFallbacks(page, url, diagnostics);
+    finishTiming(diagnostics, 'navigation', phaseStartedAt);
+
+    phaseStartedAt = Date.now();
+    const beforeConsent = await readPublisherState(page);
+    const consentHandled = await handleConsent(page, finalUrl);
+    const pageState = await readPublisherState(page);
+    if (!pageState.usable || (beforeConsent.textLength > 500 && pageState.textLength < beforeConsent.textLength * 0.1)) {
+      const error = new Error('The publisher page is empty or blocked after consent handling. Try another publisher.');
+      error.code = FAILURE_CODES.CAPTURE_CONTENT_MISSING;
+      throw error;
     }
-    await endBrowserJob();
+    diagnostics.pageState = pageState;
+    diagnostics.consent = { handled: Boolean(consentHandled), contentRetained: pageState.usable };
+    finishTiming(diagnostics, 'consent', phaseStartedAt);
+
+    phaseStartedAt = Date.now();
+    await autoScroll(page, Math.min(DEFAULT_SCROLL_SCAN_PX, 3200));
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await new Promise(r => setTimeout(r, 500));
+    finishTiming(diagnostics, 'scroll', phaseStartedAt);
+
+    phaseStartedAt = Date.now();
+    let slotDetection = await detectAdSlots(page, adWidth, adHeight, device, { returnCandidates: true });
+
+    if (!slotDetection.bestSlot) {
+      await page.evaluate(() => window.scrollTo(0, window.innerHeight * 1.2));
+      await new Promise(r => setTimeout(r, 400));
+      const secondPass = await detectAdSlots(page, adWidth, adHeight, device, { returnCandidates: true });
+      await page.evaluate(() => window.scrollTo(0, 0));
+
+      if (secondPass.bestSlot || (secondPass.candidates || []).length > (slotDetection.candidates || []).length) {
+        const merged = [...(slotDetection.candidates || []), ...(secondPass.candidates || [])];
+        const deduped = new Map();
+        for (const candidate of merged) {
+          const current = deduped.get(candidate.slotId);
+          if (!current || (candidate.score || 0) > (current.score || 0)) {
+            deduped.set(candidate.slotId, candidate);
+          }
+        }
+        slotDetection = {
+          bestSlot: secondPass.bestSlot || slotDetection.bestSlot,
+          candidates: [...deduped.values()].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8),
+          rejectedCandidates: [
+            ...(slotDetection.rejectedCandidates || []),
+            ...(secondPass.rejectedCandidates || []),
+          ].slice(0, 12),
+          rejectionSummary: summarizeReasons([
+            ...(slotDetection.rejectedCandidates || []),
+            ...(secondPass.rejectedCandidates || []),
+          ]),
+          weakBestScore: Math.max(slotDetection.weakBestScore || 0, secondPass.weakBestScore || 0),
+        };
+      }
+    }
+
+    const candidates = slotDetection.candidates || [];
+    const bestCandidate = slotDetection.bestSlot || candidates[0] || null;
+    diagnostics.slotDetection = {
+      bestSlotId: bestCandidate?.slotId || null,
+      candidateCount: candidates.length,
+      rejectedCount: slotDetection.rejectedCandidates?.length || 0,
+      rejectionSummary: slotDetection.rejectionSummary || {},
+      weakBestScore: slotDetection.weakBestScore ?? null,
+    };
+    finishTiming(diagnostics, 'slotDetection', phaseStartedAt);
+    diagnostics.finishedAt = new Date().toISOString();
+    diagnostics.durationMs = Date.now() - Date.parse(diagnostics.startedAt);
+
+    return {
+      status: bestCandidate ? 'ok' : 'warning',
+      finalUrl,
+      consentHandled,
+      candidateCount: candidates.length,
+      bestSlot: bestCandidate ? {
+        slotId: bestCandidate.slotId,
+        score: bestCandidate.score,
+        confidence: bestCandidate.confidence,
+        type: bestCandidate.type,
+        width: bestCandidate.slotWidth,
+        height: bestCandidate.slotHeight,
+        x: bestCandidate.x,
+        y: bestCandidate.y,
+        reasons: bestCandidate.reasons || [],
+      } : null,
+      rejectionSummary: slotDetection.rejectionSummary || {},
+      diagnostics: {
+        timingsMs: diagnostics.timingsMs,
+        navigationAttempts: diagnostics.navigationAttempts,
+      },
+    };
+  } catch (err) {
+    return {
+      status: 'failed',
+      failureCode: signal?.aborted ? (signal.reason?.code || 'mockup_timeout') : getErrorCode(err),
+      error: err?.message || String(err),
+      candidateCount: 0,
+      bestSlot: null,
+      diagnostics: {
+        timingsMs: diagnostics.timingsMs,
+        navigationAttempts: diagnostics.navigationAttempts,
+      },
+    };
+  } finally {
+    await job.release();
   }
 }
 
@@ -1391,10 +1417,9 @@ async function captureWebsite(
  * Render an ad tag in an isolated Puppeteer page.
  * Returns a structured response with render diagnostics for downstream placement logic.
  */
-async function renderAdTag(adTag, width, height) {
-  const browser = await getBrowser();
-  beginBrowserJob();
-  const page = await browser.newPage();
+async function renderAdTag(adTag, width, height, { signal } = {}) {
+  const job = await openBrowserJob(signal);
+  const { page } = job;
   const adTagType = classifyAdTag(adTag);
   const wrappedHtml = buildWrappedAdHtml(adTag, width, height);
 
@@ -1434,7 +1459,7 @@ async function renderAdTag(adTag, width, height) {
     const requestId = getRequestId(request);
     pendingRequests.add(requestId);
     const type = request.resourceType();
-    if (['media', 'font'].includes(type)) {
+    if (type === 'media') {
       clearRequest(request);
       request.abort();
       return;
@@ -1457,8 +1482,9 @@ async function renderAdTag(adTag, width, height) {
         imageBuffer: await createTagPlaceholder(width, height, 'Video Ad'),
         adTagType,
         renderStrategy: 'video-placeholder',
-        renderConfidence: 'high',
+        renderConfidence: 'low',
         diagnostics: {
+          placeholder: true,
           pendingRequests: 0,
           consoleErrors: [],
         },
@@ -1549,15 +1575,11 @@ async function renderAdTag(adTag, width, height) {
       },
     };
   } catch (err) {
+    signal?.throwIfAborted();
     console.error('Ad tag rendering failed:', err.message);
     return null;
   } finally {
-    try {
-      await page.close();
-    } catch (err) {
-      console.warn('Failed to close adtag page cleanly:', err?.message || err);
-    }
-    await endBrowserJob();
+    await job.release();
   }
 }
 
@@ -1597,5 +1619,6 @@ module.exports = {
   closeBrowser,
   getBrowser,
   detectAdSlots,
+  probeWebsiteAdSlots,
   injectCreativeIntoDetectedSlot,
 };

@@ -9,9 +9,19 @@ class ConcurrencyQueue {
     this.queue = [];
   }
 
-  async run(fn) {
+  async run(fn, { signal } = {}) {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(signal.reason);
+      const onAbort = () => {
+        const index = this.queue.indexOf(execute);
+        if (index !== -1) {
+          this.queue.splice(index, 1);
+          reject(signal.reason);
+        }
+      };
       const execute = async () => {
+        signal?.removeEventListener('abort', onAbort);
+        if (signal?.aborted) return reject(signal.reason);
         this.running++;
         try {
           const result = await fn();
@@ -28,6 +38,7 @@ class ConcurrencyQueue {
         execute();
       } else {
         this.queue.push(execute);
+        signal?.addEventListener('abort', onAbort, { once: true });
       }
     });
   }
@@ -58,3 +69,4 @@ const defaultConcurrency = process.env.NODE_ENV === 'production' ? 1 : 3;
 const configuredConcurrency = parseConcurrency(process.env.MOCKUP_CONCURRENCY, defaultConcurrency);
 
 module.exports = new ConcurrencyQueue(configuredConcurrency);
+module.exports.ConcurrencyQueue = ConcurrencyQueue;

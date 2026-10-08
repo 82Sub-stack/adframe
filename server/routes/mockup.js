@@ -6,10 +6,13 @@ const sharp = require('sharp');
 const path = require('path');
 const fs = require('fs');
 const { captureWebsite } = require('../services/puppeteer');
-const { generateMockup } = require('../services/ad-injector');
+const { generateMockup, getAdSizeName } = require('../services/ad-injector');
 const { isBlockedDomain } = require('../services/gemini');
 const { getEffectiveOutputDir, getUploadDir } = require('../services/settings-store');
+const { FAILURE_CODES, inferFailureCode } = require('../services/failure-codes');
 const queue = require('../utils/queue');
+const { runWithDeadline } = require('../services/job-deadline');
+const { verifyFinalCreative } = require('../services/image-verification');
 
 // Store generated mockups in memory (use disk/S3 in production)
 const mockupStore = new Map();
@@ -50,7 +53,7 @@ const TOPIC_PATH_HINTS = {
 const MOCKUP_JOB_TIMEOUT_MS = Number.parseInt(
   process.env.MOCKUP_JOB_TIMEOUT_MS || '',
   10
-) || (process.env.NODE_ENV === 'production' ? 70000 : 120000);
+) || 70000;
 
 function parseBoolean(value, defaultValue = false) {
   if (typeof value === 'boolean') return value;
@@ -67,24 +70,14 @@ function unique(items) {
   return [...new Set(items.filter(Boolean))];
 }
 
-async function withTimeout(promise, timeoutMs, errorMessage) {
-  let timer = null;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          const err = new Error(errorMessage);
-          err.code = 'MOCKUP_TIMEOUT';
-          reject(err);
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
+router.use((req, res, next) => {
+  const controller = new AbortController();
+  res.locals.generationSignal = controller.signal;
+  res.once('close', () => {
+    if (!res.writableEnded) controller.abort(new Error('The browser disconnected from the generation request.'));
+  });
+  next();
+});
 function getTopicKeywords(topic) {
   if (!topic || typeof topic !== 'string') return [];
   const cleaned = topic.trim().toLowerCase();
@@ -215,7 +208,109 @@ function normalizeSlotCandidates(slotCandidates = []) {
     width: candidate.slotWidth,
     height: candidate.slotHeight,
     confidence: getSlotConfidence(candidate.score),
+    reasons: candidate.reasons || [],
   }));
+}
+
+async function analyzeBufferUniformity(imageBuffer) {
+  const { data, info } = await sharp(imageBuffer)
+    .resize(24, 24, { fit: 'fill' })
+    .removeAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const channels = info.channels || 3;
+  let min = 255;
+  let max = 0;
+  let total = 0;
+
+  for (let index = 0; index < data.length; index += channels) {
+    const value = Math.round((data[index] + data[index + 1] + data[index + 2]) / 3);
+    min = Math.min(min, value);
+    max = Math.max(max, value);
+    total += value;
+  }
+
+  const average = total / Math.max(1, data.length / channels);
+  const spread = max - min;
+
+  return {
+    average: Number(average.toFixed(2)),
+    spread,
+    nearWhite: average >= 248 && spread <= 6,
+    uniform: spread <= 6,
+  };
+}
+
+async function assessOutputQuality(mockupBuffer, placement = {}, diagnostics = {}, creativeBuffer) {
+  const warnings = [];
+  const failures = [];
+  if (!diagnostics.pageState?.usable) failures.push('publisher-content-missing');
+  if (placement.renderConfidence === 'low') failures.push('creative-not-rendered');
+  const metadata = await sharp(mockupBuffer).metadata();
+  const pageWidth = metadata.width || 0;
+  const pageHeight = metadata.height || 0;
+  const adWidth = Number.parseInt(String(placement.adSize || '').split('x')[0], 10) || 0;
+  const adHeight = Number.parseInt(String(placement.adSize || '').split('x')[1], 10) || 0;
+  const x = Number.isFinite(placement.x) ? placement.x : null;
+  const y = Number.isFinite(placement.y) ? placement.y : null;
+
+  if (x == null || y == null || adWidth <= 0 || adHeight <= 0) {
+    failures.push('missing-placement');
+  } else if (x < 0 || y < 0 || x + adWidth > pageWidth || y + adHeight > pageHeight) {
+    failures.push('placement-out-of-bounds');
+  }
+
+  if (placement.renderConfidence === 'low') {
+    warnings.push('low-render-confidence');
+  }
+  if (placement.method === 'heuristic') {
+    warnings.push('heuristic-placement');
+  }
+  if (y != null && y < 120 && placement.method === 'heuristic') {
+    warnings.push('near-page-chrome');
+  }
+  if (placement.domInjectionFallbackReason) {
+    warnings.push(`dom-fallback-${placement.domInjectionFallbackReason}`);
+  }
+  if (diagnostics?.slotDetection?.candidateCount === 0) {
+    warnings.push('no-slot-candidates');
+  }
+
+  let placementUniformity = null;
+  if (x != null && y != null && adWidth > 0 && adHeight > 0 && pageWidth > 0 && pageHeight > 0) {
+    const safeLeft = Math.max(0, Math.min(pageWidth - 1, Math.round(x)));
+    const safeTop = Math.max(0, Math.min(pageHeight - 1, Math.round(y)));
+    const safeWidth = Math.max(1, Math.min(adWidth, pageWidth - safeLeft));
+    const safeHeight = Math.max(1, Math.min(adHeight, pageHeight - safeTop));
+    const clip = await sharp(mockupBuffer)
+      .extract({ left: safeLeft, top: safeTop, width: safeWidth, height: safeHeight })
+      .png()
+      .toBuffer();
+    placementUniformity = await analyzeBufferUniformity(clip);
+    if (placementUniformity.nearWhite && placement.renderConfidence === 'low') {
+      warnings.push('near-white-creative');
+    }
+  }
+
+  const uniqueWarnings = [...new Set(warnings)];
+  const creativeVerification = creativeBuffer && adWidth > 0 && adHeight > 0 && x != null && y != null
+    ? await verifyFinalCreative(mockupBuffer, creativeBuffer, placement, adWidth, adHeight)
+    : { passed: false, reason: 'creative-unverified' };
+  if (!creativeVerification.passed) failures.push(creativeVerification.reason);
+  const uniqueFailures = [...new Set(failures)];
+  const status = uniqueFailures.length > 0
+    ? 'failed'
+    : uniqueWarnings.length > 0 ? 'warning' : 'passed';
+
+  return {
+    status,
+    code: status === 'passed' ? null : status === 'failed' ? FAILURE_CODES.OUTPUT_QUALITY_FAILED : FAILURE_CODES.OUTPUT_QUALITY_WARNING,
+    warnings: uniqueWarnings,
+    failures: uniqueFailures,
+    placementUniformity,
+    creativeVerification,
+  };
 }
 
 async function generateAnnotatedPreview(baseScreenshotBuffer, slotCandidates = []) {
@@ -272,10 +367,12 @@ async function runGenerationJob({
   adImageBuffer,
   allowHeuristicFallbackEnabled,
   selectedSlotId = null,
+  signal: parentSignal,
 }) {
   const [adWidth, adHeight] = adSize.split('x').map(Number);
 
-  return queue.run(async () => {
+  return runWithDeadline(signal => queue.run(async () => {
+    signal.throwIfAborted();
     const captureResult = await captureWebsite(
       url,
       deviceType,
@@ -286,6 +383,7 @@ async function runGenerationJob({
         adTag: adTag || null,
         adImageBuffer: adImageBuffer || null,
         slotId: selectedSlotId || null,
+        signal,
       }
     );
 
@@ -302,29 +400,43 @@ async function runGenerationJob({
 
     if (captureResult.domInjection?.succeeded) {
       const mockup = captureResult.screenshot;
+      const placement = {
+        x: captureResult.domInjection.x,
+        y: captureResult.domInjection.y,
+        adSize,
+        adSizeName: getAdSizeName(adSize),
+        method: selectedSlotId ? 'user-selected' : 'dom-injected',
+        slotId: captureResult.domInjection.selectedSlotId || selectedSlotId || captureResult.detectedSlot?.slotId || null,
+        adTagRendered: captureResult.preparedCreative?.adTagRendered || Boolean(adTag),
+        adTagType: captureResult.preparedCreative?.adTagType || null,
+        renderStrategy: captureResult.preparedCreative?.renderStrategy || null,
+        renderConfidence: captureResult.preparedCreative?.renderConfidence || null,
+        visuallyVerified: Boolean(captureResult.domInjection.visuallyVerified),
+        visualDiffRatio: captureResult.domInjection.visualDiffRatio ?? null,
+        confidence: selectedCandidate?.confidence || 'high',
+        detectionScore: captureResult.domInjection.selectedSlotScore,
+        slotType: captureResult.domInjection.selectedSlotType,
+      };
+      const quality = await assessOutputQuality(mockup, placement, captureResult.diagnostics, captureResult.preparedCreative?.adImageBuffer);
+      assertOutputQuality(quality);
+      signal.throwIfAborted();
       return {
         mockup,
         annotatedPreview: await generateAnnotatedPreview(mockup, captureResult.slotCandidates || []),
         slotCandidates,
-        placement: {
-          x: captureResult.domInjection.x,
-          y: captureResult.domInjection.y,
-          adSize,
-          adSizeName: getAdSizeName(adSize),
-          method: selectedSlotId ? 'user-selected' : 'dom-injected',
-          slotId: captureResult.domInjection.selectedSlotId || selectedSlotId || captureResult.detectedSlot?.slotId || null,
-          adTagRendered: captureResult.preparedCreative?.adTagRendered || Boolean(adTag),
-          adTagType: captureResult.preparedCreative?.adTagType || null,
-          renderStrategy: captureResult.preparedCreative?.renderStrategy || null,
-          renderConfidence: captureResult.preparedCreative?.renderConfidence || null,
-          visuallyVerified: Boolean(captureResult.domInjection.visuallyVerified),
-          visualDiffRatio: captureResult.domInjection.visualDiffRatio ?? null,
-        },
+        placement,
+        quality,
+        diagnostics: captureResult.diagnostics,
         consentHandled: captureResult.consentHandled,
         finalUrl: captureResult.finalUrl || url,
       };
     }
 
+    if (selectedSlotId || !allowHeuristicFallbackEnabled) {
+      const error = new Error('No safe, visible ad placement could be verified. Try another publisher or placement.');
+      error.code = FAILURE_CODES.NO_RELIABLE_SLOT;
+      throw error;
+    }
     const preparedCreative = captureResult.preparedCreative || {};
     const mockupResult = await generateMockup({
       screenshotBuffer: captureResult.screenshot,
@@ -333,7 +445,7 @@ async function runGenerationJob({
       adSize,
       adTag: preparedCreative.adTag ?? (adTag || null),
       adImageBuffer: preparedCreative.adImageBuffer ?? (adImageBuffer || null),
-      detectedSlot: selectedCandidate || captureResult.detectedSlot,
+      detectedSlot: null,
       allowHeuristicFallback: allowHeuristicFallbackEnabled,
     });
 
@@ -349,15 +461,27 @@ async function runGenerationJob({
     mockupResult.placement.renderStrategy = preparedCreative.renderStrategy || null;
     mockupResult.placement.renderConfidence = preparedCreative.renderConfidence || null;
     mockupResult.placement.method = selectedSlotId ? 'user-selected' : mockupResult.placement.method;
+    const quality = await assessOutputQuality(mockupResult.mockup, mockupResult.placement, captureResult.diagnostics, preparedCreative.adImageBuffer || adImageBuffer);
+    assertOutputQuality(quality);
+    signal.throwIfAborted();
 
     return {
       ...mockupResult,
       annotatedPreview: await generateAnnotatedPreview(mockupResult.mockup, captureResult.slotCandidates || []),
       slotCandidates,
+      quality,
+      diagnostics: captureResult.diagnostics,
       consentHandled: captureResult.consentHandled,
       finalUrl: captureResult.finalUrl || url,
     };
-  });
+  }, { signal }), MOCKUP_JOB_TIMEOUT_MS, parentSignal);
+}
+
+function assertOutputQuality(quality) {
+  if (quality.status !== 'failed') return;
+  const error = new Error(`The generated image failed validation: ${quality.failures.join(', ')}. Try another publisher or creative.`);
+  error.code = FAILURE_CODES.OUTPUT_QUALITY_FAILED;
+  throw error;
 }
 
 function pruneMockupStore() {
@@ -375,6 +499,7 @@ function pruneMockupStore() {
     if (value.annotatedPath && fs.existsSync(value.annotatedPath)) {
       fs.unlinkSync(value.annotatedPath);
     }
+    if (value.metadataPath && fs.existsSync(value.metadataPath)) fs.unlinkSync(value.metadataPath);
     mockupStore.delete(key);
     mockupStore.delete(`adtag-${key}`);
   });
@@ -392,6 +517,8 @@ function storeMockupResult({
   fs.mkdirSync(outputDir, { recursive: true });
   const mockupPath = path.join(outputDir, `${mockupId}.png`);
   fs.writeFileSync(mockupPath, mockupBuffer);
+  const metadataPath = path.join(outputDir, `${mockupId}.json`);
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
 
   let annotatedPath = null;
   if (annotatedPreviewBuffer) {
@@ -402,6 +529,7 @@ function storeMockupResult({
   mockupStore.set(mockupId, {
     path: mockupPath,
     annotatedPath,
+    metadataPath,
     metadata,
     request,
   });
@@ -427,6 +555,8 @@ function buildMockupResponse(mockupId, metadata) {
       adSizeName: metadata.adSizeName,
       device: metadata.device,
       placement: metadata.placement,
+      quality: metadata.quality || null,
+      diagnostics: metadata.diagnostics || null,
       consentHandled: metadata.consentHandled,
     },
   };
@@ -438,35 +568,36 @@ router.post('/', upload.single('adImage'), async (req, res) => {
   try {
     const { websiteUrl, topic, adSize, device, adTag, allowHeuristicFallback } = req.body;
     const adImage = req.file;
+    let adImageBuffer = null;
     const allowHeuristicFallbackEnabled = parseBoolean(allowHeuristicFallback, false);
 
     // Validation
     if (!websiteUrl) {
-      return res.status(400).json({ error: 'Website URL is required' });
+      return res.status(400).json({ error: 'Website URL is required', failureCode: FAILURE_CODES.INVALID_INPUT });
     }
     if (!adSize) {
-      return res.status(400).json({ error: 'Ad size is required' });
+      return res.status(400).json({ error: 'Ad size is required', failureCode: FAILURE_CODES.INVALID_INPUT });
     }
 
     const validSizes = ['300x250', '300x600', '728x90', '160x600', '970x250'];
     if (!validSizes.includes(adSize)) {
-      return res.status(400).json({ error: `Invalid ad size. Valid sizes: ${validSizes.join(', ')}` });
+      return res.status(400).json({ error: `Invalid ad size. Valid sizes: ${validSizes.join(', ')}`, failureCode: FAILURE_CODES.INVALID_INPUT });
     }
 
     const validDevices = ['desktop', 'mobile'];
     const deviceType = device || 'desktop';
     if (!validDevices.includes(deviceType)) {
-      return res.status(400).json({ error: 'Device must be "desktop" or "mobile"' });
+      return res.status(400).json({ error: 'Device must be "desktop" or "mobile"', failureCode: FAILURE_CODES.INVALID_INPUT });
     }
 
     // Check mobile-only restriction
     const desktopOnlySizes = ['728x90', '160x600', '970x250'];
     if (deviceType === 'mobile' && desktopOnlySizes.includes(adSize)) {
-      return res.status(400).json({ error: `${adSize} is a desktop-only ad size` });
+      return res.status(400).json({ error: `${adSize} is a desktop-only ad size`, failureCode: FAILURE_CODES.INVALID_INPUT });
     }
 
     if (!adTag && !adImage) {
-      return res.status(400).json({ error: 'Either an ad tag or ad image is required' });
+      return res.status(400).json({ error: 'Either an ad tag or ad image is required', failureCode: FAILURE_CODES.INVALID_INPUT });
     }
 
     // Validate image dimensions if uploaded
@@ -478,10 +609,12 @@ router.post('/', upload.single('adImage'), async (req, res) => {
         if (Math.abs(meta.width - expectedWidth) > 2 || Math.abs(meta.height - expectedHeight) > 2) {
           return res.status(400).json({
             error: `Image dimensions (${meta.width}x${meta.height}) don't match selected ad size (${adSize}). Please upload an image with the correct dimensions.`,
+            failureCode: FAILURE_CODES.INVALID_INPUT,
           });
         }
+        adImageBuffer = fs.readFileSync(adImage.path);
       } catch (err) {
-        return res.status(400).json({ error: 'Could not read uploaded image' });
+        return res.status(400).json({ error: 'Could not read uploaded image', failureCode: FAILURE_CODES.INVALID_INPUT });
       }
     }
 
@@ -494,6 +627,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     if (isBlockedDomain(url)) {
       return res.status(400).json({
         error: 'This domain is not supported for mockups (social platforms, search engines, ecommerce, and video sites are excluded). Please use a publisher website.',
+        failureCode: FAILURE_CODES.BLOCKED_DOMAIN,
       });
     }
 
@@ -503,16 +637,18 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     if (isBlockedDomain(url)) {
       return res.status(400).json({
         error: 'This domain is not supported for mockups (social platforms, search engines, ecommerce, and video sites are excluded). Please use a publisher website.',
+        failureCode: FAILURE_CODES.BLOCKED_DOMAIN,
       });
     }
 
     let finalWebsiteUrl = url;
     const result = await runGenerationJob({
       url,
+      signal: res.locals.generationSignal,
       adSize,
       deviceType,
       adTag,
-      adImageBuffer: adImage ? adImage.buffer : null,
+      adImageBuffer,
       allowHeuristicFallbackEnabled,
     });
 
@@ -523,6 +659,8 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       adSizeName: result.placement.adSizeName,
       device: deviceType,
       placement: result.placement,
+      quality: result.quality,
+      diagnostics: result.diagnostics,
       consentHandled: result.consentHandled,
       slotCandidates: result.slotCandidates || [],
       hasAdTag: Boolean(adTag),
@@ -535,7 +673,7 @@ router.post('/', upload.single('adImage'), async (req, res) => {
       device: deviceType,
       allowHeuristicFallback: allowHeuristicFallbackEnabled,
       adTag: adTag || null,
-      adImageBuffer: adImage ? adImage.buffer : null,
+      adImageBuffer,
     };
 
     const mockupId = storeMockupResult({
@@ -549,29 +687,36 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     res.json(buildMockupResponse(mockupId, storedMetadata));
   } catch (err) {
     console.error('Mockup generation error:', err);
+    if ([FAILURE_CODES.OUTPUT_QUALITY_FAILED, FAILURE_CODES.CAPTURE_CONTENT_MISSING, FAILURE_CODES.ADTAG_RENDER_FAILED, FAILURE_CODES.NO_RELIABLE_SLOT].includes(err.code)) {
+      return res.status(422).json({ error: err.message, failureCode: err.code });
+    }
     const message = err?.message || '';
 
     if (err.code === 'MOCKUP_TIMEOUT' || message.includes('timeout') || message.includes('Timeout')) {
       return res.status(504).json({
         error: 'Mockup generation timed out. Try a different website or retry in a moment.',
+        failureCode: inferFailureCode(err),
       });
     }
 
     if (/ERR_SSL_VERSION_OR_CIPHER_MISMATCH|ERR_SSL_PROTOCOL_ERROR|ERR_CERT_/i.test(message)) {
       return res.status(422).json({
         error: 'The target domain has an SSL/TLS configuration issue for automated browsing. Try the site with "http://" or use an alternate subdomain.',
+        failureCode: inferFailureCode(err),
       });
     }
 
     if (err.code === 'NO_RELIABLE_SLOT') {
       return res.status(422).json({
         error: err.message,
+        failureCode: inferFailureCode(err),
       });
     }
 
     if (err.code === 'INVALID_SLOT_ID') {
       return res.status(422).json({
         error: err.message,
+        failureCode: inferFailureCode(err),
       });
     }
 
@@ -580,11 +725,13 @@ router.post('/', upload.single('adImage'), async (req, res) => {
     ) {
       return res.status(503).json({
         error: 'Mockup generation failed due to temporary server resource limits. Please retry in a moment.',
+        failureCode: inferFailureCode(err),
       });
     }
 
     res.status(500).json({
       error: 'Failed to generate mockup. Please try again.',
+      failureCode: inferFailureCode(err),
       details: process.env.NODE_ENV !== 'production' ? err.message : undefined,
     });
   } finally {
@@ -619,6 +766,7 @@ router.post('/:id/inject', async (req, res) => {
 
     const result = await runGenerationJob({
       url: request.websiteUrl,
+      signal: res.locals.generationSignal,
       adSize: request.adSize,
       deviceType: request.device,
       adTag: request.adTag,
@@ -633,6 +781,8 @@ router.post('/:id/inject', async (req, res) => {
       adSizeName: result.placement.adSizeName,
       device: request.device,
       placement: result.placement,
+      quality: result.quality,
+      diagnostics: result.diagnostics,
       consentHandled: result.consentHandled,
       slotCandidates: result.slotCandidates || existing.metadata?.slotCandidates || [],
       hasAdTag: Boolean(request.adTag),
@@ -650,13 +800,18 @@ router.post('/:id/inject', async (req, res) => {
     res.json(buildMockupResponse(mockupId, storedMetadata));
   } catch (err) {
     console.error('Targeted mockup generation error:', err);
+    if (err.code === 'MOCKUP_TIMEOUT') return res.status(504).json({ error: err.message, failureCode: FAILURE_CODES.MOCKUP_TIMEOUT });
+    if ([FAILURE_CODES.OUTPUT_QUALITY_FAILED, FAILURE_CODES.CAPTURE_CONTENT_MISSING, FAILURE_CODES.ADTAG_RENDER_FAILED, FAILURE_CODES.NO_RELIABLE_SLOT].includes(err.code)) {
+      return res.status(422).json({ error: err.message, failureCode: err.code });
+    }
 
     if (err.code === 'INVALID_SLOT_ID' || err.code === 'NO_RELIABLE_SLOT') {
-      return res.status(422).json({ error: err.message });
+      return res.status(422).json({ error: err.message, failureCode: inferFailureCode(err) });
     }
 
     res.status(500).json({
       error: 'Failed to generate mockup for the selected slot. Please try again.',
+      failureCode: inferFailureCode(err),
       details: process.env.NODE_ENV !== 'production' ? err.message : undefined,
     });
   }

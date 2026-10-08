@@ -14,18 +14,15 @@ const { configureSettingsStore } = require('./services/settings-store');
 
 function createApp(options = {}) {
   const app = express();
-  const isDesktop = Boolean(options.isDesktop || process.env.ADFRAME_DESKTOP === 'true');
   const dataDir = options.dataDir || process.env.ADFRAME_DATA_DIR || path.join(__dirname, 'data');
   const defaultOutputDir = options.outputDir ||
     process.env.ADFRAME_OUTPUT_DIR ||
-    (isDesktop ? path.join(dataDir, 'mockups') : path.join(__dirname, 'output'));
+    path.join(__dirname, 'output');
   const clientDistPath = options.staticDir || path.join(__dirname, '..', 'client', 'dist');
 
   configureSettingsStore({
     dataDir,
     defaultOutputDir,
-    isDesktop,
-    chromiumMode: process.env.ADFRAME_CHROMIUM_MODE || (isDesktop ? 'bundled' : 'system'),
     appVersion: process.env.ADFRAME_APP_VERSION,
   });
 
@@ -35,7 +32,7 @@ function createApp(options = {}) {
   }));
 
   app.use(cors({
-    origin: process.env.NODE_ENV === 'production' || isDesktop
+    origin: process.env.NODE_ENV === 'production'
       ? true
       : ['http://localhost:5173', 'http://localhost:3000', 'http://localhost:3001'],
     credentials: true,
@@ -46,13 +43,13 @@ function createApp(options = {}) {
 
   const apiLimiter = rateLimit({
     windowMs: 1 * 60 * 1000,
-    max: isDesktop ? 120 : 30,
+    max: 30,
     message: { error: 'Too many requests, please try again in a minute.' },
   });
 
   const mockupLimiter = rateLimit({
     windowMs: 1 * 60 * 1000,
-    max: isDesktop ? 30 : 10,
+    max: 10,
     message: { error: 'Too many mockup requests. Please wait a moment.' },
   });
 
@@ -64,6 +61,8 @@ function createApp(options = {}) {
   app.use('/api', downloadRoutes);
 
   app.use(express.static(clientDistPath));
+
+  app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
   app.get('*', (req, res) => {
     if (req.path.startsWith('/api/')) {

@@ -17,7 +17,7 @@ export default function DeviceFrame({ children }) {
           <div className="h-[28px] bg-black" />
 
           {/* Content */}
-          <div className="overflow-hidden" style={{ maxHeight: 572 }}>
+          <div className="overflow-y-auto" style={{ maxHeight: 572 }}>
             {children}
           </div>
         </div>

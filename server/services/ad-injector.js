@@ -27,57 +27,65 @@ function calculateFallbackPlacement(adWidth, adHeight, pageWidth, pageHeight, de
   const viewportH = device === 'mobile' ? 844 : 900;
   // Typical page layout: header ~80px, nav ~50px, content starts ~150px
   const contentStart = 150;
+  const placements = [];
 
-  let x, y;
+  const addPlacement = (x, y, label) => {
+    placements.push({
+      x: Math.max(0, Math.min(Math.round(x), pageWidth - adWidth)),
+      y: Math.max(10, Math.min(Math.round(y), pageHeight - adHeight - 10)),
+      label,
+    });
+  };
 
   switch (adSize) {
     case '728x90':
     case '970x250':
       // Leaderboard/Billboard: centered, just below navigation
-      x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
-      y = contentStart;
+      addPlacement(Math.floor((pageWidth - adWidth) / 2), contentStart, 'below-nav');
+      addPlacement(Math.floor((pageWidth - adWidth) / 2), contentStart + 160, 'mid-article');
       break;
 
     case '300x250':
       if (device === 'mobile') {
         // Mobile: centered, between content blocks (~1.5 screens down)
-        x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
-        y = Math.min(Math.floor(viewportH * 1.5), pageHeight - adHeight - 20);
+        addPlacement(Math.floor((pageWidth - adWidth) / 2), Math.min(Math.floor(viewportH * 1.15), pageHeight - adHeight - 20), 'mobile-midpage');
+        addPlacement(Math.floor((pageWidth - adWidth) / 2), contentStart + 120, 'mobile-after-header');
       } else {
         // Desktop: right sidebar area. Content is typically 60-70% width.
         const contentAreaWidth = Math.floor(pageWidth * 0.65);
-        x = Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20);
-        y = contentStart + 100;
+        addPlacement(Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20), contentStart + 100, 'right-rail');
+        addPlacement(Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20), contentStart + 360, 'right-rail-lower');
+        addPlacement(Math.floor((pageWidth - adWidth) / 2), contentStart + 260, 'inline-center');
       }
       break;
 
     case '300x600':
       if (device === 'mobile') {
-        x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
-        y = Math.min(Math.floor(viewportH * 1.2), pageHeight - adHeight - 20);
+        addPlacement(Math.floor((pageWidth - adWidth) / 2), Math.min(Math.floor(viewportH * 0.9), pageHeight - adHeight - 20), 'mobile-tall-midpage');
       } else {
         const contentAreaWidth = Math.floor(pageWidth * 0.65);
-        x = Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20);
-        y = contentStart + 50;
+        addPlacement(Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20), contentStart + 50, 'right-rail-tall');
+        addPlacement(Math.min(contentAreaWidth + 20, pageWidth - adWidth - 20), contentStart + 220, 'right-rail-tall-lower');
       }
       break;
 
     case '160x600':
       // Skyscraper: left sidebar, below header
-      x = 10;
-      y = contentStart + 50;
+      addPlacement(10, contentStart + 50, 'left-rail');
+      addPlacement(pageWidth - adWidth - 20, contentStart + 50, 'right-edge-rail');
       break;
 
     default:
-      x = Math.max(0, Math.floor((pageWidth - adWidth) / 2));
-      y = Math.min(Math.floor(viewportH * 0.5), pageHeight - adHeight - 20);
+      addPlacement(Math.floor((pageWidth - adWidth) / 2), Math.min(Math.floor(viewportH * 0.5), pageHeight - adHeight - 20), 'center');
   }
 
-  // Ensure bounds
-  x = Math.max(0, Math.min(x, pageWidth - adWidth));
-  y = Math.max(10, Math.min(y, pageHeight - adHeight - 10));
+  const selected = placements.find((placement) => (
+    placement.y >= 120 &&
+    placement.x >= 0 &&
+    placement.y + adHeight <= pageHeight
+  )) || placements[0] || { x: 0, y: 120, label: 'default' };
 
-  return { x, y };
+  return selected;
 }
 
 /**
@@ -152,6 +160,7 @@ async function generateMockup({
   // Determine placement: prefer detected slot, fallback to heuristic
   let x, y;
   let placementMethod;
+  let fallbackVariant = null;
 
   if (detectedSlot) {
     x = detectedSlot.x;
@@ -169,6 +178,7 @@ async function generateMockup({
     const fallback = calculateFallbackPlacement(adWidth, adHeight, pageWidth, pageHeight, device, adSize);
     x = fallback.x;
     y = fallback.y;
+    fallbackVariant = fallback.label;
     placementMethod = 'heuristic';
     console.log(`No ad slot detected, using heuristic placement at (${x}, ${y})`);
   }
@@ -198,6 +208,7 @@ async function generateMockup({
       adSize,
       adSizeName: getAdSizeName(adSize),
       method: placementMethod,
+      fallbackVariant,
       adTagRendered,
       confidence: detectedSlot?.confidence || (placementMethod === 'heuristic' ? 'low' : undefined),
       detectionScore: detectedSlot?.score,

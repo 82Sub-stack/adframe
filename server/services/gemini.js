@@ -7,6 +7,8 @@ const { getFallbackPublishers } = require('./fallback-publishers');
 const { BLOCKED_DOMAINS } = require('./blocked-domains');
 const { getGeminiApiKey } = require('./settings-store');
 
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+
 let genAI = null;
 let activeApiKey = null;
 
@@ -39,6 +41,22 @@ function isBlockedDomain(url) {
   } catch {
     return false;
   }
+}
+
+function extractJsonPayload(text = '') {
+  const trimmed = String(text || '').trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
+  }
+
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
+  }
+
+  return trimmed;
 }
 
 /**
@@ -76,7 +94,7 @@ Respond ONLY in this exact JSON format, no other text:
   try {
     const client = getClient();
     const model = client.getGenerativeModel({
-      model: 'gemini-2.0-flash',
+      model: GEMINI_MODEL,
       generationConfig: {
         temperature: 0.2,
         maxOutputTokens: 4096,
@@ -87,14 +105,7 @@ Respond ONLY in this exact JSON format, no other text:
     const response = result.response;
     const text = response.text();
 
-    // Extract JSON from the response (handle markdown code blocks)
-    let jsonStr = text;
-    const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      jsonStr = jsonMatch[1].trim();
-    }
-
-    const parsed = JSON.parse(jsonStr);
+    const parsed = JSON.parse(extractJsonPayload(text));
 
     if (parsed.suggestions && Array.isArray(parsed.suggestions) && parsed.suggestions.length > 0) {
       // Validate each suggestion has required fields and isn't a blocked domain

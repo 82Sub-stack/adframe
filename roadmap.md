@@ -1,45 +1,27 @@
 # Roadmap
 
-## Next Focus
+## Current focus
 
-Improve mockup selection and generation quality so users get more relevant publisher choices, better ad placements, and more reliable final mockups.
+Keep AdFrame on the web and measure usable screenshots rather than counting returned files.
 
-## Phase 1: Selection Quality
+## Completed — October 2026
 
-- Audit the current suggestion scoring pipeline.
-- Compare fallback corpus results against Gemini results.
-- Improve ranking signals for reachable pages, ad-slot evidence, topic fit, country fit, and page quality.
-- Add clearer rejection reasons for weak candidates.
-- Keep the default suggestion pool at 20-30 sites per country where possible.
+- Removed the local-app distribution path and desktop settings.
+- Protected publisher content, preserved creative size and iframe layout, and rejected covered/unsafe placements.
+- Added stable slot IDs, failed-attempt rollback and final creative pixel validation.
+- Connected request deadlines to cancellation and isolated browser contexts.
+- Aligned capture defaults and benchmarks with the web deployment.
+- Added browser/API regressions, all supported format cases, and GitHub Actions checks.
+- Made desktop/mobile mockup previews scrollable.
 
-## Phase 2: Capture And Placement Quality
+## Next
 
-- Review screenshot capture failures and timeout behavior.
-- Improve ad-slot detection for common publisher layouts.
-- Add safer fallback placements when no slot is detected.
-- Reduce mockups where ads overlap navigation, cookie banners, sticky UI, or unreadable page areas.
-- Add output quality checks before saving final images.
+1. Deploy the reviewed web changes and run the live smoke against the hosted server.
+2. Tune the Germany catalog using successful captures with the new validation. Reject stale generation-proven rankings when live slot probes fail.
+3. Expand live samples across devices, formats and actual vendor tags, recording first-attempt success, verified quality and generation duration.
+4. Store recent success by publisher, device, format and verification date instead of a permanent boolean.
+5. Add durable object storage and a persistent download index if results must survive restarts or multiple servers.
 
-## Phase 3: User Selection Workflow
+## Historical baseline
 
-- Make ranked candidates easier to compare before generation.
-- Show why a site was recommended: reachability, ad signals, topic match, and confidence.
-- Allow users to retry or replace weak sites without restarting the full flow.
-- Consider saving recently successful publisher selections per country/topic.
-
-## Phase 4: Reliability And Measurement
-
-- Add focused smoke tests for suggestion and mockup generation flows.
-- Track generation failure reasons in local logs.
-- Add a small benchmark set of countries/topics/ad sizes.
-- Use benchmark results to tune ranking and fallback placement rules.
-
-## Immediate Next Step
-
-Run a focused audit of the current generation pipeline and produce concrete changes for:
-
-- website ranking,
-- page capture robustness,
-- ad placement detection,
-- fallback placement rules,
-- and final output quality checks.
+The June 7 full benchmark produced 22 HTTP-successful mockups from 28 attempts. It tested only 300×250 desktop image creatives and did not establish visual success. The earlier 23/27 claim was inconsistent and has been removed.
