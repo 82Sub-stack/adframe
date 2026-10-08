@@ -11,6 +11,7 @@ const { isBlockedDomain } = require('../services/gemini');
 const { getEffectiveOutputDir, getUploadDir } = require('../services/settings-store');
 const { FAILURE_CODES, inferFailureCode } = require('../services/failure-codes');
 const queue = require('../utils/queue');
+const { storeFailureDiagnostic } = require('../services/capture-diagnostics');
 const { runWithDeadline } = require('../services/job-deadline');
 const { verifyFinalCreative } = require('../services/image-verification');
 
@@ -71,6 +72,8 @@ function unique(items) {
 }
 
 router.use((req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = body => originalJson(res.locals.failureDiagnostic ? { ...body, diagnostic: res.locals.failureDiagnostic } : body);
   const controller = new AbortController();
   res.locals.generationSignal = controller.signal;
   res.once('close', () => {
@@ -373,107 +376,116 @@ async function runGenerationJob({
 
   return runWithDeadline(signal => queue.run(async () => {
     signal.throwIfAborted();
-    const captureResult = await captureWebsite(
-      url,
-      deviceType,
-      adWidth,
-      adHeight,
-      () => {},
-      {
-        adTag: adTag || null,
-        adImageBuffer: adImageBuffer || null,
-        slotId: selectedSlotId || null,
-        signal,
+    let captureResult;
+    try {
+      captureResult = await captureWebsite(
+        url,
+        deviceType,
+        adWidth,
+        adHeight,
+        () => {},
+        {
+          adTag: adTag || null,
+          adImageBuffer: adImageBuffer || null,
+          slotId: selectedSlotId || null,
+          signal,
+        }
+      );
+
+      const slotCandidates = normalizeSlotCandidates(captureResult.slotCandidates || []);
+      const selectedCandidate = selectedSlotId
+        ? (captureResult.slotCandidates || []).find((candidate) => candidate.slotId === selectedSlotId)
+        : captureResult.detectedSlot;
+
+      if (selectedSlotId && !selectedCandidate) {
+        const err = new Error('The selected ad slot is no longer available on this page.');
+        err.code = 'INVALID_SLOT_ID';
+        throw err;
       }
-    );
 
-    const slotCandidates = normalizeSlotCandidates(captureResult.slotCandidates || []);
-    const selectedCandidate = selectedSlotId
-      ? (captureResult.slotCandidates || []).find((candidate) => candidate.slotId === selectedSlotId)
-      : captureResult.detectedSlot;
+      if (captureResult.domInjection?.succeeded) {
+        const mockup = captureResult.screenshot;
+        const placement = {
+          x: captureResult.domInjection.x,
+          y: captureResult.domInjection.y,
+          adSize,
+          adSizeName: getAdSizeName(adSize),
+          method: selectedSlotId ? 'user-selected' : 'dom-injected',
+          slotId: captureResult.domInjection.selectedSlotId || selectedSlotId || captureResult.detectedSlot?.slotId || null,
+          adTagRendered: captureResult.preparedCreative?.adTagRendered || Boolean(adTag),
+          adTagType: captureResult.preparedCreative?.adTagType || null,
+          renderStrategy: captureResult.preparedCreative?.renderStrategy || null,
+          renderConfidence: captureResult.preparedCreative?.renderConfidence || null,
+          visuallyVerified: Boolean(captureResult.domInjection.visuallyVerified),
+          visualDiffRatio: captureResult.domInjection.visualDiffRatio ?? null,
+          confidence: selectedCandidate?.confidence || 'high',
+          detectionScore: captureResult.domInjection.selectedSlotScore,
+          slotType: captureResult.domInjection.selectedSlotType,
+        };
+        const quality = await assessOutputQuality(mockup, placement, captureResult.diagnostics, captureResult.preparedCreative?.adImageBuffer);
+        assertOutputQuality(quality);
+        signal.throwIfAborted();
+        return {
+          mockup,
+          annotatedPreview: await generateAnnotatedPreview(mockup, captureResult.slotCandidates || []),
+          slotCandidates,
+          placement,
+          quality,
+          diagnostics: captureResult.diagnostics,
+          consentHandled: captureResult.consentHandled,
+          finalUrl: captureResult.finalUrl || url,
+        };
+      }
 
-    if (selectedSlotId && !selectedCandidate) {
-      const err = new Error('The selected ad slot is no longer available on this page.');
-      err.code = 'INVALID_SLOT_ID';
-      throw err;
-    }
-
-    if (captureResult.domInjection?.succeeded) {
-      const mockup = captureResult.screenshot;
-      const placement = {
-        x: captureResult.domInjection.x,
-        y: captureResult.domInjection.y,
+      if (selectedSlotId || !allowHeuristicFallbackEnabled) {
+        const error = new Error('No safe, visible ad placement could be verified. Try another publisher or placement.');
+        error.code = FAILURE_CODES.NO_RELIABLE_SLOT;
+        throw error;
+      }
+      const preparedCreative = captureResult.preparedCreative || {};
+      const mockupResult = await generateMockup({
+        screenshotBuffer: captureResult.screenshot,
+        dimensions: captureResult.dimensions,
+        device: deviceType,
         adSize,
-        adSizeName: getAdSizeName(adSize),
-        method: selectedSlotId ? 'user-selected' : 'dom-injected',
-        slotId: captureResult.domInjection.selectedSlotId || selectedSlotId || captureResult.detectedSlot?.slotId || null,
-        adTagRendered: captureResult.preparedCreative?.adTagRendered || Boolean(adTag),
-        adTagType: captureResult.preparedCreative?.adTagType || null,
-        renderStrategy: captureResult.preparedCreative?.renderStrategy || null,
-        renderConfidence: captureResult.preparedCreative?.renderConfidence || null,
-        visuallyVerified: Boolean(captureResult.domInjection.visuallyVerified),
-        visualDiffRatio: captureResult.domInjection.visualDiffRatio ?? null,
-        confidence: selectedCandidate?.confidence || 'high',
-        detectionScore: captureResult.domInjection.selectedSlotScore,
-        slotType: captureResult.domInjection.selectedSlotType,
-      };
-      const quality = await assessOutputQuality(mockup, placement, captureResult.diagnostics, captureResult.preparedCreative?.adImageBuffer);
+        adTag: preparedCreative.adTag ?? (adTag || null),
+        adImageBuffer: preparedCreative.adImageBuffer ?? (adImageBuffer || null),
+        detectedSlot: null,
+        allowHeuristicFallback: allowHeuristicFallbackEnabled,
+      });
+
+      if (captureResult.domInjection?.reason && captureResult.domInjection.reason !== 'not-attempted') {
+        mockupResult.placement.domInjectionFallbackReason = captureResult.domInjection.reason;
+      }
+      if (preparedCreative.adTagRendered) {
+        mockupResult.placement.adTagRendered = true;
+      }
+
+      mockupResult.placement.slotId = selectedSlotId || selectedCandidate?.slotId || captureResult.detectedSlot?.slotId || null;
+      mockupResult.placement.adTagType = preparedCreative.adTagType || null;
+      mockupResult.placement.renderStrategy = preparedCreative.renderStrategy || null;
+      mockupResult.placement.renderConfidence = preparedCreative.renderConfidence || null;
+      mockupResult.placement.method = selectedSlotId ? 'user-selected' : mockupResult.placement.method;
+      const quality = await assessOutputQuality(mockupResult.mockup, mockupResult.placement, captureResult.diagnostics, preparedCreative.adImageBuffer || adImageBuffer);
       assertOutputQuality(quality);
       signal.throwIfAborted();
+
       return {
-        mockup,
-        annotatedPreview: await generateAnnotatedPreview(mockup, captureResult.slotCandidates || []),
+        ...mockupResult,
+        annotatedPreview: await generateAnnotatedPreview(mockupResult.mockup, captureResult.slotCandidates || []),
         slotCandidates,
-        placement,
         quality,
         diagnostics: captureResult.diagnostics,
         consentHandled: captureResult.consentHandled,
         finalUrl: captureResult.finalUrl || url,
       };
-    }
-
-    if (selectedSlotId || !allowHeuristicFallbackEnabled) {
-      const error = new Error('No safe, visible ad placement could be verified. Try another publisher or placement.');
-      error.code = FAILURE_CODES.NO_RELIABLE_SLOT;
+    } catch (error) {
+      if (captureResult && !signal.aborted) {
+        error.captureDiagnostics ||= captureResult.diagnostics;
+        error.diagnosticScreenshot ||= captureResult.screenshot;
+      }
       throw error;
     }
-    const preparedCreative = captureResult.preparedCreative || {};
-    const mockupResult = await generateMockup({
-      screenshotBuffer: captureResult.screenshot,
-      dimensions: captureResult.dimensions,
-      device: deviceType,
-      adSize,
-      adTag: preparedCreative.adTag ?? (adTag || null),
-      adImageBuffer: preparedCreative.adImageBuffer ?? (adImageBuffer || null),
-      detectedSlot: null,
-      allowHeuristicFallback: allowHeuristicFallbackEnabled,
-    });
-
-    if (captureResult.domInjection?.reason && captureResult.domInjection.reason !== 'not-attempted') {
-      mockupResult.placement.domInjectionFallbackReason = captureResult.domInjection.reason;
-    }
-    if (preparedCreative.adTagRendered) {
-      mockupResult.placement.adTagRendered = true;
-    }
-
-    mockupResult.placement.slotId = selectedSlotId || selectedCandidate?.slotId || captureResult.detectedSlot?.slotId || null;
-    mockupResult.placement.adTagType = preparedCreative.adTagType || null;
-    mockupResult.placement.renderStrategy = preparedCreative.renderStrategy || null;
-    mockupResult.placement.renderConfidence = preparedCreative.renderConfidence || null;
-    mockupResult.placement.method = selectedSlotId ? 'user-selected' : mockupResult.placement.method;
-    const quality = await assessOutputQuality(mockupResult.mockup, mockupResult.placement, captureResult.diagnostics, preparedCreative.adImageBuffer || adImageBuffer);
-    assertOutputQuality(quality);
-    signal.throwIfAborted();
-
-    return {
-      ...mockupResult,
-      annotatedPreview: await generateAnnotatedPreview(mockupResult.mockup, captureResult.slotCandidates || []),
-      slotCandidates,
-      quality,
-      diagnostics: captureResult.diagnostics,
-      consentHandled: captureResult.consentHandled,
-      finalUrl: captureResult.finalUrl || url,
-    };
   }, { signal }), MOCKUP_JOB_TIMEOUT_MS, parentSignal);
 }
 
@@ -686,7 +698,9 @@ router.post('/', upload.single('adImage'), async (req, res) => {
 
     res.json(buildMockupResponse(mockupId, storedMetadata));
   } catch (err) {
-    console.error('Mockup generation error:', err);
+    const diagnostic = storeFailureDiagnostic(err);
+    if (diagnostic) res.locals.failureDiagnostic = diagnostic;
+    console.error('Mockup generation error:', err.message);
     if ([FAILURE_CODES.OUTPUT_QUALITY_FAILED, FAILURE_CODES.CAPTURE_CONTENT_MISSING, FAILURE_CODES.ADTAG_RENDER_FAILED, FAILURE_CODES.NO_RELIABLE_SLOT].includes(err.code)) {
       return res.status(422).json({ error: err.message, failureCode: err.code });
     }
@@ -799,7 +813,8 @@ router.post('/:id/inject', async (req, res) => {
 
     res.json(buildMockupResponse(mockupId, storedMetadata));
   } catch (err) {
-    console.error('Targeted mockup generation error:', err);
+    res.locals.failureDiagnostic = storeFailureDiagnostic(err);
+    console.error('Targeted mockup generation error:', err.message);
     if (err.code === 'MOCKUP_TIMEOUT') return res.status(504).json({ error: err.message, failureCode: FAILURE_CODES.MOCKUP_TIMEOUT });
     if ([FAILURE_CODES.OUTPUT_QUALITY_FAILED, FAILURE_CODES.CAPTURE_CONTENT_MISSING, FAILURE_CODES.ADTAG_RENDER_FAILED, FAILURE_CODES.NO_RELIABLE_SLOT].includes(err.code)) {
       return res.status(422).json({ error: err.message, failureCode: err.code });

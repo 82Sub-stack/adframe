@@ -257,6 +257,17 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
             </div>
             <h3 className="text-lg font-semibold text-text-primary mb-2">Candidate Failed</h3>
             <p className="text-sm text-text-muted leading-relaxed">{current.error}</p>
+            {current.diagnostic && (
+              <div className="mt-4 space-y-3 text-sm">
+                <p>{current.diagnostic.summary}</p>
+                {current.diagnostic.previewUrl && (
+                  <a href={current.diagnostic.previewUrl} target="_blank" rel="noopener noreferrer" className="block text-accent underline">
+                    View captured page (diagnostic, without a verified ad)
+                  </a>
+                )}
+                <a href={current.diagnostic.reportUrl} target="_blank" rel="noopener noreferrer" className="block text-accent underline">Open diagnostic report</a>
+              </div>
+            )}
             {current.failureCode && (
               <div className="mt-2 text-xs text-red-700">Code: {current.failureCode}</div>
             )}

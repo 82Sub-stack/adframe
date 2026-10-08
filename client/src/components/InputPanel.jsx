@@ -277,6 +277,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
             websiteUrl,
             error: err.response?.data?.error || 'Failed to generate this candidate.',
             failureCode: err.response?.data?.failureCode || null,
+            diagnostic: err.response?.data?.diagnostic || null,
           });
         }
 
@@ -287,7 +288,8 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
       }
 
       if (results.length === 0) {
-        onError(failures[0]?.error || 'No mockups could be generated from the ranked candidates.');
+        onResult(failures);
+        onProgress('');
         return;
       }
 

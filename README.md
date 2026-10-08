@@ -34,6 +34,14 @@ The defaults use the same viewport, scan depth and capture height as the web dep
 - Production recycles idle Chrome after each completed job to release browser memory between captures.
 - Heuristic placement remains an explicit opt-in and receives a warning; it cannot silently mask a rejected detected slot.
 
+## Publisher profiles and failure diagnostics
+
+Sport1 and FinanzNachrichten use host-specific ad selectors and wait up to three seconds for stable ad-host geometry. Known larger advertising containers can hold a smaller creative at its original size, centered in the existing space. These profiles never bypass editorial, undersized, sticky, clipping, occlusion or final-pixel checks. Redirects use the destination host's profile; other sites retain generic detection.
+
+Failed captures return a separate diagnostic report and, when available, a page image through the web interface, even when every candidate fails. Reports include consent/content state, profile readiness, timing, slot dimensions and rejection reasons. Diagnostic images are labelled as failed captures, never as successful mockups. A timeout cancels the browser immediately and does not wait for a diagnostic screenshot.
+
+Diagnostic files are separate from mockup downloads, capped at 20 reports with associated images, and expire after 24 hours. Cleanup runs on writes and reads; diagnostic URLs also expire on a process restart. They share Render's ephemeral storage.
+
 ## Validation
 
 - `npm test`: local browser fixtures covering every supported desktop/mobile format, consent cleanup, visibility, rollback, slot identity, tag rendering, timeouts, API errors and downloads. No external publisher pages are required.

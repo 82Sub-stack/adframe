@@ -32,6 +32,6 @@ async function main() {
     }
   } finally { await closeBrowser(); server.closeAllConnections();await new Promise(resolve=>server.close(resolve)); }
   console.log(`Report: ${path.join(directory,'report.json')}`);
-  if (!results.some(result=>result.metadata?.quality?.status==='passed')) process.exitCode=1;
+  if (results.some(result=>result.metadata?.quality?.status!=='passed')) process.exitCode=1;
 }
 main().catch(async error=>{console.error(error);await closeBrowser();process.exitCode=1;});
