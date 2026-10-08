@@ -17,6 +17,10 @@ async function fixtureServer() {
     if (url.pathname === '/hang') return;
     res.setHeader('Content-Type', 'text/html');
     if (url.pathname === '/blank') return res.end('<body></body>');
+    if (url.pathname === '/remote-ad-frame') {
+      return res.end(publisher().replace('<div id="ad-container-test" class="ad-container"><span>Anzeige</span></div>',
+        '<iframe id="google_ads_iframe_test" class="ad-container" style="border:0" width="300" height="250" src="https://googleads.g.doubleclick.net/pagead/adframe-test"></iframe>'));
+    }
     const extra = url.pathname === '/covered' ? '<div style="position:fixed;inset:0;z-index:10000;background:blue">Other content</div>' : '';
     res.end(publisher(Number(url.searchParams.get('width')) || 300, Number(url.searchParams.get('height')) || 250, extra));
   });

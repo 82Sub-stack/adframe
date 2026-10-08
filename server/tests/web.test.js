@@ -39,6 +39,13 @@ test('HTML image tags pass the complete web route',async()=>{
   assert.equal(result.status,200,JSON.stringify(result.body));assert.equal(result.body.metadata.quality.status,'passed');assert.equal(result.body.metadata.placement.adTagRendered,true);
 });
 
+test('remote ad frames retain a usable slot without loading their network creative', async () => {
+  const result = await postMockup(baseUrl, fixture.url + '/remote-ad-frame', await creative());
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.metadata.quality.status, 'passed');
+  assert.equal(result.body.metadata.placement.slotType, 'iframe');
+});
+
 for(const [name,pathname,code] of [['empty publisher','/blank','capture_content_missing'],['undersized slot','/?height=203','no_reliable_slot'],['covered slot','/covered','no_reliable_slot']]) {
   test(`${name} returns an actionable error without saving a mockup`,async()=>{
     const before=fs.readdirSync(outputDir).length;

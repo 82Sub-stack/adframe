@@ -31,6 +31,7 @@ The defaults use the same viewport, scan depth and capture height as the web dep
 - Source pixels are compared against the actual injected creative and the final screenshot. Failed validation returns an actionable error instead of saving a misleading mockup.
 - Ad tags that do not render, including unsupported video placeholders, are rejected. Fonts are loaded rather than blocked.
 - Each capture has an isolated browser context. Deadline expiration and browser disconnect cancel queued work and close the affected context.
+- Production recycles Chrome after each completed job and skips remote advertising frame documents during publisher capture to limit memory use. Consent frames, page assets and separate ad-tag rendering remain available.
 - Heuristic placement remains an explicit opt-in and receives a warning; it cannot silently mask a rejected detected slot.
 
 ## Validation

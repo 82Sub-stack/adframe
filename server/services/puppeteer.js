@@ -46,7 +46,7 @@ const ADTAG_RENDER_MAX_WAIT_MS = Number.parseInt(
 const BROWSER_RECYCLE_EVERY = Number.parseInt(
   process.env.BROWSER_RECYCLE_EVERY || '',
   10
-) || (IS_PRODUCTION ? 25 : 0);
+) || (IS_PRODUCTION ? 1 : 0);
 
 let browserInstance = null;
 let browserLaunchPromise = null;
@@ -194,6 +194,20 @@ async function waitForPageAssets(page) {
   });
 }
 
+async function configurePublisherRequests(page) {
+  await page.setRequestInterception(true);
+  page.on('request', req => {
+    const type = req.resourceType();
+    const hostname = new URL(req.url()).hostname;
+    // Preserve publisher content and consent frames. Ad-frame elements remain
+    // measurable even when their remote creative documents are not loaded.
+    const remoteAdFrame = type === 'document' && req.frame() !== page.mainFrame() &&
+      /(^|\.)(doubleclick\.net|googlesyndication\.com|amazon-adsystem\.com|adnxs\.com|rubiconproject\.com|criteo\.(com|net)|adition\.com|smartadserver\.com|adform\.net|adsrvr\.org|pubmatic\.com|openx\.net|casalemedia\.com|yieldlab\.net)$/.test(hostname);
+    const action = type === 'media' || remoteAdFrame ? req.abort() : req.continue();
+    action.catch(() => {});
+  });
+}
+
 async function readPublisherState(page) {
   return page.evaluate(() => {
     const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
@@ -218,6 +232,9 @@ async function endBrowserJob() {
     activeBrowserJobs === 0 &&
     browserInstance
   ) {
+    // A caller may hold a page outside the managed capture contexts.
+    const remainingPages = await browserInstance.pages();
+    if (remainingPages.length > 1 || remainingPages.some(page => page.url() !== 'about:blank')) return;
     console.log(`Recycling browser after ${completedBrowserJobs} completed jobs`);
     await closeBrowser();
     completedBrowserJobs = 0;
@@ -1011,16 +1028,7 @@ async function captureWebsite(
     await page.setViewport(viewport);
     await page.setUserAgent(ua);
 
-    // Block heavy resources but keep ads-related stuff for slot detection
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      const type = req.resourceType();
-      if (type === 'media') {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
+    await configurePublisherRequests(page);
 
     onProgress('Loading page...');
 
@@ -1294,15 +1302,7 @@ async function probeWebsiteAdSlots(
 
     await page.setViewport(viewport);
     await page.setUserAgent(ua);
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      const type = req.resourceType();
-      if (type === 'media') {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
+    await configurePublisherRequests(page);
 
     let phaseStartedAt = Date.now();
     const finalUrl = await navigateWithFallbacks(page, url, diagnostics);

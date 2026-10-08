@@ -30,7 +30,7 @@ services:
       - key: ADTAG_WAIT_MS
         value: "1500"
       - key: BROWSER_RECYCLE_EVERY
-        value: "25"
+        value: "1"
       - key: SUGGESTION_PREFLIGHT_TIMEOUT_MS
         value: "4500"
       - key: SUGGESTION_PREFLIGHT_CONCURRENCY

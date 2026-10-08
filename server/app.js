@@ -14,6 +14,8 @@ const { configureSettingsStore } = require('./services/settings-store');
 
 function createApp(options = {}) {
   const app = express();
+  // Render forwards requests through its edge proxy; trust only the nearest hop.
+  app.set('trust proxy', process.env.RENDER === 'true' ? 1 : false);
   const dataDir = options.dataDir || process.env.ADFRAME_DATA_DIR || path.join(__dirname, 'data');
   const defaultOutputDir = options.outputDir ||
     process.env.ADFRAME_OUTPUT_DIR ||
