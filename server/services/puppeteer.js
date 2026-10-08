@@ -194,20 +194,6 @@ async function waitForPageAssets(page) {
   });
 }
 
-async function configurePublisherRequests(page) {
-  await page.setRequestInterception(true);
-  page.on('request', req => {
-    const type = req.resourceType();
-    const hostname = new URL(req.url()).hostname;
-    // Preserve publisher content and consent frames. Ad-frame elements remain
-    // measurable even when their remote creative documents are not loaded.
-    const remoteAdFrame = type === 'document' && req.frame() !== page.mainFrame() &&
-      /(^|\.)(doubleclick\.net|googlesyndication\.com|amazon-adsystem\.com|adnxs\.com|rubiconproject\.com|criteo\.(com|net)|adition\.com|smartadserver\.com|adform\.net|adsrvr\.org|pubmatic\.com|openx\.net|casalemedia\.com|yieldlab\.net)$/.test(hostname);
-    const action = type === 'media' || remoteAdFrame ? req.abort() : req.continue();
-    action.catch(() => {});
-  });
-}
-
 async function readPublisherState(page) {
   return page.evaluate(() => {
     const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
@@ -1028,7 +1014,11 @@ async function captureWebsite(
     await page.setViewport(viewport);
     await page.setUserAgent(ua);
 
-    await configurePublisherRequests(page);
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const action = req.resourceType() === 'media' ? req.abort() : req.continue();
+      action.catch(() => {});
+    });
 
     onProgress('Loading page...');
 
@@ -1302,7 +1292,11 @@ async function probeWebsiteAdSlots(
 
     await page.setViewport(viewport);
     await page.setUserAgent(ua);
-    await configurePublisherRequests(page);
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const action = req.resourceType() === 'media' ? req.abort() : req.continue();
+      action.catch(() => {});
+    });
 
     let phaseStartedAt = Date.now();
     const finalUrl = await navigateWithFallbacks(page, url, diagnostics);
