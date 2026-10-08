@@ -13,6 +13,7 @@ jobs:
       NODE_ENV: production
       MOCKUP_CONCURRENCY: '1'
       PUPPETEER_SKIP_DOWNLOAD: 'true'
+      PUPPETEER_CACHE_DIR: ${{ runner.temp }}/puppeteer
       CURATED_SLOT_PROBE: 'false'
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +27,7 @@ jobs:
             server/package-lock.json
       - run: npm ci
       - run: npm run build
-      - run: npm exec --prefix server -- puppeteer browsers install chrome --install-deps
+      - name: Install Chrome and Linux dependencies
+        run: sudo env "PATH=$PATH" "PUPPETEER_CACHE_DIR=$PUPPETEER_CACHE_DIR" npm exec --prefix server -- puppeteer browsers install chrome --install-deps
       - run: npm test
       - run: npm run check:curated
