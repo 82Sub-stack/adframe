@@ -46,7 +46,7 @@ const ADTAG_RENDER_MAX_WAIT_MS = Number.parseInt(
 const BROWSER_RECYCLE_EVERY = Number.parseInt(
   process.env.BROWSER_RECYCLE_EVERY || '',
   10
-) || (IS_PRODUCTION ? 25 : 0);
+) || (IS_PRODUCTION ? 1 : 0);
 
 let browserInstance = null;
 let browserLaunchPromise = null;
@@ -218,6 +218,9 @@ async function endBrowserJob() {
     activeBrowserJobs === 0 &&
     browserInstance
   ) {
+    // A caller may hold a page outside the managed capture contexts.
+    const remainingPages = await browserInstance.pages();
+    if (remainingPages.length > 1 || remainingPages.some(page => page.url() !== 'about:blank')) return;
     console.log(`Recycling browser after ${completedBrowserJobs} completed jobs`);
     await closeBrowser();
     completedBrowserJobs = 0;
@@ -1011,15 +1014,10 @@ async function captureWebsite(
     await page.setViewport(viewport);
     await page.setUserAgent(ua);
 
-    // Block heavy resources but keep ads-related stuff for slot detection
     await page.setRequestInterception(true);
     page.on('request', req => {
-      const type = req.resourceType();
-      if (type === 'media') {
-        req.abort();
-      } else {
-        req.continue();
-      }
+      const action = req.resourceType() === 'media' ? req.abort() : req.continue();
+      action.catch(() => {});
     });
 
     onProgress('Loading page...');
@@ -1296,12 +1294,8 @@ async function probeWebsiteAdSlots(
     await page.setUserAgent(ua);
     await page.setRequestInterception(true);
     page.on('request', req => {
-      const type = req.resourceType();
-      if (type === 'media') {
-        req.abort();
-      } else {
-        req.continue();
-      }
+      const action = req.resourceType() === 'media' ? req.abort() : req.continue();
+      action.catch(() => {});
     });
 
     let phaseStartedAt = Date.now();
