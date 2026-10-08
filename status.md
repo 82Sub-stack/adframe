@@ -1,33 +1,42 @@
 # Project Status
 
-## Current State
+## Current direction — 2026-10-08
 
-AdFrame is ready for internal macOS testing as a locally executed desktop app. The Electron app, local Express server, settings storage, configurable output folder, bundled Chromium path, and expanded country publisher corpus are merged into `main`.
+AdFrame is a web application. React is served by the Express web server; Puppeteer captures publisher pages on the server. Render is the supported deployment. Electron, desktop packaging and desktop-only settings have been removed. Downloads use the user's browser.
 
-## Distribution
+## Implemented
 
-- Internal unsigned macOS DMG path is active.
-- Current prepared artifact: `release/AdFrame-1.0.0-arm64.dmg`.
-- Recipient install note: `release/README-INSTALL.txt`.
-- Distribution guide: `docs/internal-macos-dmg-distribution.md`.
-- Signing/notarization is optional future work and remains separate from the active internal distribution path.
+- Protected publisher content during consent cleanup and added empty/blocked-page rejection.
+- Exact creative dimensions, explicit ad evidence and safe iframe layout preservation.
+- Stable slot identities, targeted-slot enforcement and rollback of failed attempts.
+- Creative pixel verification after injection and in the final screenshot, including layout remeasurement after returning to the top.
+- Output quality failures stop saving; JSON quality metadata accompanies accepted images.
+- Enforced 70-second job deadlines, queued-job cancellation and isolated browser context cleanup.
+- Fonts are retained and visible assets receive a bounded readiness wait.
+- Scrollable desktop and phone previews expose the full captured page.
+- Server-managed web settings; no public key or server-folder mutations.
+- Expanded production benchmark with separate verified-success, HTTP-success and warning metrics.
+- Added automated browser/API regressions and a GitHub Actions web validation workflow.
+- Retained the previously local curated Germany catalog, candidate backups and diagnostics.
 
-## Validation Completed
+## Validation
 
-- Web/client build passes.
-- macOS desktop package builds.
-- Packaged macOS app smoke test passed.
-- Bundled Chromium mode works in the packaged app.
-- Website suggestions return scored results.
-- Audits previously returned zero vulnerabilities.
+- `npm test`: 24/24 browser and API regressions passed.
+- `npm run build`: passed.
+- `npm run check:curated`: passed.
+- Live production smoke: Sport1, Gala, Focus and FinanzNachrichten all returned verified 300×250 desktop mockups. Generation times were 7–11 seconds per page.
+- Report: `server/output/web-smoke/2026-10-08T07-11-53-339Z/report.json` (ignored local artifact).
+- Controlled coverage includes all seven offered format/device combinations and HTML image, document.write and generic-script tags. Actual third-party vendor tags and the hosted server were not comprehensively tested.
 
-## Open Blockers
+These are a small live sample and controlled regression results, not a universal publisher success claim. Historical June results are not evidence of current visual correctness: the June 7 benchmark returned 22 images from 28 attempts using only 300×250 desktop image uploads.
 
-No blockers before improving mockup selection and generation.
+## Deployment
 
-## Known Constraints
+The Render configuration uses Node 22, a health check, a project-local Chrome cache and one concurrent browser job. No deployment is triggered by local validation. The code must be reviewed and deployed before the hosted application uses these fixes.
 
-- Current macOS package is Apple Silicon (`arm64`).
-- Windows runtime validation was intentionally skipped.
-- Unsigned internal builds require first-launch Gatekeeper approval on macOS.
-- The app still needs internet access for publisher pages and Gemini-backed suggestions.
+## Remaining constraints
+
+- Some publishers have no safe compatible slot within the capture limit; these return a clear failure.
+- Default curated suggestions support Germany and eight topics.
+- Live vendor tags still depend on network access, vendor behavior and consent; controlled tag fixtures do not certify every vendor integration.
+- Generated download links use an in-memory index and expire after restart/pruning. Durable storage and multiple server instances are future work.

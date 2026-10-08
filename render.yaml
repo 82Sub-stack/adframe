@@ -3,12 +3,19 @@ services:
     name: adframe
     runtime: node
     plan: starter
-    buildCommand: npm install && npm run build && cd server && npx puppeteer browsers install chrome
+    buildCommand: npm ci && npm run build && npm exec --prefix server -- puppeteer browsers install chrome
     startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/project/src/.cache/puppeteer
       - key: NODE_ENV
         value: production
       - key: MOCKUP_CONCURRENCY
+        value: "1"
+      - key: MOCKUP_JOB_TIMEOUT_MS
+        value: "70000"
+      - key: CURATED_SLOT_PROBE_CONCURRENCY
         value: "1"
       - key: CAPTURE_MAX_SCROLL_PX
         value: "1600"

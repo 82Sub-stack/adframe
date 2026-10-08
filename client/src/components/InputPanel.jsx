@@ -6,8 +6,18 @@ import AdSizeSelector from './AdSizeSelector';
 import WebsiteSuggestions from './WebsiteSuggestions';
 
 const COUNTRIES = [
-  'Germany', 'Austria', 'Switzerland', 'United Kingdom',
-  'France', 'Italy', 'Spain', 'Netherlands', 'Poland',
+  'Germany',
+];
+
+const TOPICS = [
+  { value: 'sports', label: 'Sports' },
+  { value: 'finance', label: 'Finance' },
+  { value: 'news', label: 'News' },
+  { value: 'tech', label: 'Tech' },
+  { value: 'automotive', label: 'Automotive' },
+  { value: 'lifestyle', label: 'Lifestyle' },
+  { value: 'cooking', label: 'Cooking' },
+  { value: 'travel', label: 'Travel' },
 ];
 
 const PROGRESS_STEPS = [
@@ -19,7 +29,7 @@ const PROGRESS_STEPS = [
   'Generating mockup...',
 ];
 
-const SUGGESTION_LIMIT = 24;
+const SUGGESTION_LIMIT = 5;
 const MAX_SELECTED_URLS = 5;
 const MOCKUP_COUNT_OPTIONS = [1, 2, 3, 5];
 
@@ -32,6 +42,12 @@ function getRankedViableUrls(suggestions = []) {
     .filter((site) => site?.url && site.preflight?.status !== 'failed')
     .sort((a, b) => getSuggestionScore(b) - getSuggestionScore(a))
     .map((site) => site.url);
+}
+
+function isWeakSuggestion(site) {
+  return site?.preflight?.status === 'failed' ||
+    site?.preflight?.confidence === 'low' ||
+    (site?.preflight?.score ?? 0) < 48;
 }
 
 export default function InputPanel({ onResult, onGenerating, onProgress, onError }) {
@@ -48,6 +64,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
   const [mockupCount, setMockupCount] = useState(2);
   const [overrideUrl, setOverrideUrl] = useState('');
   const [suggestions, setSuggestions] = useState(null);
+  const [backupSuggestions, setBackupSuggestions] = useState([]);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
   const [suggestionsError, setSuggestionsError] = useState(null);
   const [selectedUrls, setSelectedUrls] = useState([]);
@@ -101,6 +118,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
     setSuggestionsLoading(true);
     setSuggestionsError(null);
     setSuggestions(null);
+    setBackupSuggestions([]);
     setSelectedUrls([]);
 
     try {
@@ -112,8 +130,10 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
         limit: SUGGESTION_LIMIT,
       });
       const rankedSuggestions = res.data.suggestions || [];
+      const rankedBackups = res.data.backupSuggestions || [];
       setSuggestions(rankedSuggestions);
-      setSelectedUrls(getRankedViableUrls(rankedSuggestions).slice(0, mockupCount));
+      setBackupSuggestions(rankedBackups);
+      setSelectedUrls(getRankedViableUrls(rankedSuggestions).slice(0, MAX_SELECTED_URLS));
     } catch (err) {
       setSuggestionsError(
         err.response?.data?.error || 'Failed to fetch suggestions. Using fallback...'
@@ -121,6 +141,28 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
     } finally {
       setSuggestionsLoading(false);
     }
+  };
+
+  const replaceWeakSelections = () => {
+    const allSuggestions = [...(suggestions || []), ...(backupSuggestions || [])];
+    const byUrl = new Map(allSuggestions.map((site) => [site.url, site]));
+    const strongUrls = getRankedViableUrls(allSuggestions)
+      .filter((url) => !isWeakSuggestion(byUrl.get(url)));
+    const currentStrong = selectedUrls.filter((url) => {
+      const site = byUrl.get(url);
+      return site && !isWeakSuggestion(site);
+    });
+    const next = [];
+
+    for (const url of currentStrong) {
+      if (!next.includes(url)) next.push(url);
+    }
+    for (const url of strongUrls) {
+      if (next.length >= MAX_SELECTED_URLS) break;
+      if (!next.includes(url)) next.push(url);
+    }
+
+    setSelectedUrls(next.slice(0, MAX_SELECTED_URLS));
   };
 
   const buildTargetUrls = () => {
@@ -141,12 +183,12 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
       addCandidate(url);
     }
 
-    for (const url of getRankedViableUrls(suggestions || [])) {
+    for (const url of getRankedViableUrls(backupSuggestions || [])) {
       addCandidate(url);
     }
 
     if (candidates.length === 0) {
-      return { error: 'Please select ranked website suggestions or enter a specific URL' };
+      return { error: 'Please select curated website suggestions or enter a specific URL' };
     }
 
     if (candidates.length < desiredCount) {
@@ -167,7 +209,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
 
     const cleanedTopic = topic.trim();
     if (!cleanedTopic) {
-      onError('Please enter a topic to match relevant site sections');
+      onError('Please select a category');
       return;
     }
 
@@ -220,7 +262,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
         try {
           const res = await axios.post('/api/generate-mockup', formData, {
             headers: { 'Content-Type': 'multipart/form-data' },
-            timeout: 240000,
+            timeout: 90000,
           });
 
           results.push({
@@ -234,6 +276,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
             failed: true,
             websiteUrl,
             error: err.response?.data?.error || 'Failed to generate this candidate.',
+            failureCode: err.response?.data?.failureCode || null,
           });
         }
 
@@ -285,18 +328,21 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
 
       <div>
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-1.5">
-          Topic / Vertical
+          Category
         </label>
-        <input
-          type="text"
-          value={topic}
-          onChange={(e) => setTopic(e.target.value)}
-          placeholder="e.g. sports, soccer, ai security, gaming laptops"
-          className="w-full px-3 py-2.5 rounded-lg border border-gray-200 text-sm focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20"
-        />
-        <p className="text-xs text-text-muted mt-1">
-          Used to target matching subdomains/sections (for example, sports pages on news sites).
-        </p>
+        <div className="relative">
+          <select
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            className="w-full appearance-none px-3 py-2.5 pr-8 rounded-lg border border-gray-200 text-sm bg-white focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent/20"
+          >
+            <option value="">Select a category...</option>
+            {TOPICS.map((entry) => (
+              <option key={entry.value} value={entry.value}>{entry.label}</option>
+            ))}
+          </select>
+          <ChevronDown size={14} className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted pointer-events-none" />
+        </div>
       </div>
 
       <div>
@@ -337,6 +383,16 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
         selectedUrls={selectedUrls}
         onToggle={toggleSuggestedUrl}
       />
+
+      {Array.isArray(suggestions) && selectedUrls.some((url) => isWeakSuggestion(suggestions.find((site) => site.url === url))) && (
+        <button
+          type="button"
+          onClick={replaceWeakSelections}
+          className="w-full py-2 rounded-lg border border-yellow-300 bg-yellow-50 text-yellow-900 text-xs font-medium hover:bg-yellow-100 transition-colors"
+        >
+          Replace weak selected publishers
+        </button>
+      )}
 
       <div>
         <label className="block text-xs font-semibold text-text-muted uppercase tracking-wide mb-1.5">
@@ -487,7 +543,7 @@ export default function InputPanel({ onResult, onGenerating, onProgress, onError
           <span>
             Allow heuristic fallback when no reliable ad slot is found
             <span className="block text-text-muted mt-0.5">
-              Disabled means generation fails instead of placing ads in potentially wrong spots.
+              Disabled means a failed curated candidate is skipped and backups are tried instead of forcing a risky placement.
             </span>
           </span>
         </label>

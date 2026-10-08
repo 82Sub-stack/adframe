@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Install Chrome dependencies and Chrome
 RUN apt-get update && apt-get install -y \
@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Puppeteer to use the installed Chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
@@ -47,6 +47,8 @@ RUN cd client && npm run build
 
 # Set environment (PORT is set by Render at runtime, defaults to 10000)
 ENV NODE_ENV=production
+ENV MOCKUP_CONCURRENCY=1
+ENV MOCKUP_JOB_TIMEOUT_MS=70000
 
 # Start server
 CMD ["node", "server/server.js"]

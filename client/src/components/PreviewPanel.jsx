@@ -47,6 +47,19 @@ function getPlacementConfidenceInfo(confidence) {
   }
 }
 
+function getQualityInfo(quality) {
+  switch (quality?.status) {
+    case 'passed':
+      return { label: 'Quality passed', className: 'bg-emerald-100 text-emerald-700' };
+    case 'warning':
+      return { label: 'Quality warning', className: 'bg-yellow-100 text-yellow-800' };
+    case 'failed':
+      return { label: 'Quality failed', className: 'bg-red-100 text-red-700' };
+    default:
+      return null;
+  }
+}
+
 function getTabLabel(item, idx) {
   if (item?.failed) return `Failed ${idx + 1}`;
   try {
@@ -98,12 +111,9 @@ function renderPreviewFrame({ isMobile, url, websiteUrl, alt }) {
           </div>
         </div>
       </div>
-      <img
-        src={url}
-        alt={alt}
-        className="w-full"
-        style={{ maxHeight: '70vh', objectFit: 'contain', imageRendering: 'auto' }}
-      />
+      <div className="max-h-[70vh] overflow-auto">
+        <img src={url} alt={alt} className="w-full h-auto" style={{ imageRendering: 'auto' }} />
+      </div>
     </div>
   );
 }
@@ -136,6 +146,7 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
   const previewUrl = pickerVisible && showAnnotated ? annotatedPreviewUrl : currentPreviewUrl;
   const methodInfo = current && !current.failed ? getPlacementMethodInfo(current.metadata?.placement?.method) : null;
   const confidenceInfo = current && !current.failed ? getPlacementConfidenceInfo(current.metadata?.placement?.confidence) : null;
+  const qualityInfo = current && !current.failed ? getQualityInfo(current.metadata?.quality) : null;
 
   const selectedSlot = useMemo(
     () => slotCandidates.find((candidate) => candidate.slotId === selectedSlotId) || slotCandidates[0] || null,
@@ -246,6 +257,9 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
             </div>
             <h3 className="text-lg font-semibold text-text-primary mb-2">Candidate Failed</h3>
             <p className="text-sm text-text-muted leading-relaxed">{current.error}</p>
+            {current.failureCode && (
+              <div className="mt-2 text-xs text-red-700">Code: {current.failureCode}</div>
+            )}
             {current.websiteUrl && (
               <div className="flex items-center justify-center gap-1.5 mt-3 text-xs text-text-muted">
                 <ExternalLink size={11} />
@@ -301,6 +315,11 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
             {metadata.placement?.renderConfidence && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-200 text-text-primary text-xs capitalize">
                 Render {metadata.placement.renderConfidence}
+              </span>
+            )}
+            {qualityInfo && (
+              <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs ${qualityInfo.className}`}>
+                {qualityInfo.label}
               </span>
             )}
           </div>
@@ -374,6 +393,15 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
         </div>
       )}
 
+      {metadata.quality?.status && metadata.quality.status !== 'passed' && (
+        <div className="mb-4 rounded-lg border border-yellow-200 bg-yellow-50 px-4 py-3 text-sm text-yellow-900">
+          <div className="font-semibold">Output quality needs review</div>
+          <div className="mt-1 text-xs leading-relaxed">
+            {[...(metadata.quality.failures || []), ...(metadata.quality.warnings || [])].slice(0, 4).join(' | ')}
+          </div>
+        </div>
+      )}
+
       <div className="flex justify-center">
         {renderPreviewFrame({
           isMobile,
@@ -424,6 +452,11 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
                       <div className="text-xs text-text-muted mt-1">
                         Score {candidate.score} · {candidate.type} · {candidate.confidence} confidence
                       </div>
+                      {Array.isArray(candidate.reasons) && candidate.reasons.length > 0 && (
+                        <div className="text-xs text-text-muted mt-1">
+                          Signals: {candidate.reasons.slice(0, 3).join(', ')}
+                        </div>
+                      )}
                     </div>
                     <div className={`text-xs font-semibold ${isSelected ? 'text-accent' : 'text-text-muted'}`}>
                       {candidate.slotId === metadata.placement?.slotId ? 'Current' : `#${candidate.rank}`}
@@ -463,6 +496,12 @@ export default function PreviewPanel({ result, onResultChange, isGenerating, pro
         )}
         {metadata.placement.visualDiffRatio != null && (
           <span> · Visual diff {metadata.placement.visualDiffRatio}</span>
+        )}
+        {metadata.quality?.status && (
+          <span> · quality {metadata.quality.status}</span>
+        )}
+        {metadata.diagnostics?.slotDetection?.rejectionSummary && Object.keys(metadata.diagnostics.slotDetection.rejectionSummary).length > 0 && (
+          <span> · rejected: {Object.entries(metadata.diagnostics.slotDetection.rejectionSummary).slice(0, 2).map(([key, count]) => `${key} ${count}`).join(', ')}</span>
         )}
       </div>
     </div>

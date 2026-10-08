@@ -1,0 +1,31 @@
+name: Web validation
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      NODE_ENV: production
+      MOCKUP_CONCURRENCY: '1'
+      PUPPETEER_SKIP_DOWNLOAD: 'true'
+      CURATED_SLOT_PROBE: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            client/package-lock.json
+            server/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - run: npm exec --prefix server -- puppeteer browsers install chrome --install-deps
+      - run: npm test
+      - run: npm run check:curated
