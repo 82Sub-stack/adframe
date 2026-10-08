@@ -1,6 +1,15 @@
 const express = require('express');
 const router = express.Router();
 const fs = require('fs');
+const { getFailureDiagnostic } = require('../services/capture-diagnostics');
+
+router.get('/capture-diagnostics/:id/:kind', (req, res) => {
+  const artifact = getFailureDiagnostic(req.params.id, req.params.kind);
+  if (!artifact) return res.status(404).json({ error: 'Diagnostic expired or unavailable.' });
+  res.set('Cache-Control', 'no-store');
+  if (req.params.kind === 'report') return res.json(artifact);
+  return res.type('png').sendFile(artifact);
+});
 
 // Reference to mockup store (set by server.js)
 let mockupStore = null;

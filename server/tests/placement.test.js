@@ -105,3 +105,55 @@ test('image, document.write and script tags produce verified pixels; empty and v
   assert.equal((await renderAdTag('<script src="data:text/javascript,throw%20new%20Error()"></script>',300,250)).renderConfidence,'low');
   assert.equal((await renderAdTag('<script src="https://example.invalid/vpaid.js"></script>',300,250)).renderConfidence,'low');
 });
+
+const { getPublisherProfile, waitForPublisherSlots } = require('../services/publisher-profiles');
+test('publisher profiles only match exact approved hosts', () => {
+  assert.equal(getPublisherProfile('https://www.sport1.de/').id, 'sport1');
+  assert.equal(getPublisherProfile('https://finanznachrichten.de/').id, 'finanznachrichten');
+  for (const url of ['https://sport1.de.example.org/', 'https://example.org/?sport1.de', 'https://unsupported.sport1.de/', 'invalid']) assert.equal(getPublisherProfile(url), null);
+});
+
+async function withProfilePage(url, html, fn) {
+  const currentBrowser = await getBrowser();
+  const context = await currentBrowser.createBrowserContext();
+  try {
+    const page = await context.newPage();
+    await page.setViewport({width:1366,height:900});
+    await page.setRequestInterception(true);
+    page.on('request', request => request.respond({ status: 200, contentType: 'text/html', body: html }).catch(() => {}));
+    await page.goto(url, {waitUntil:'domcontentloaded'});
+    await fn(page);
+  } finally { await context.close(); }
+}
+
+for (const [url, identity, width, height] of [['https://www.sport1.de/', 'class="sport1-ad"', 1041, 250], ['https://www.finanznachrichten.de/', 'id="dmr1"', 300, 600]]) {
+  test(`profile preserves a larger ${width}x${height} ad host and verifies a 300x250 creative on ${url}`, async () => {
+    const html = `<style>body{margin:0}.test-slot{position:absolute;left:50px;top:100px;width:${width}px;height:${height}px}</style><div ${identity} style="position:absolute;left:50px;top:100px;width:${width}px;height:${height}px"></div>`;
+    await withProfilePage(url, html, async page => {
+      assert.equal((await waitForPublisherSlots(page,getPublisherProfile(url),300,250)).status,'stable');
+      const detected=await detectAdSlots(page,300,250,'desktop',{returnCandidates:true});
+      assert.ok(detected.bestSlot,JSON.stringify(detected));
+      const png=await creative();
+      const result=await injectCreativeIntoDetectedSlot(page,detected.bestSlot,{adImageBuffer:png,slotCandidates:detected.candidates});
+      assert.equal(result.succeeded,true,JSON.stringify(result));
+      assert.equal(result.width,300);assert.equal(result.height,250);
+      const host=await page.$eval('[data-adframe-slot-id]',el=>({width:el.getBoundingClientRect().width,height:el.getBoundingClientRect().height}));
+      assert.deepEqual(host,{width,height});
+      assert.equal((await verifyFinalCreative(Buffer.from(await page.screenshot()),png,result,300,250)).passed,true);
+    });
+  });
+}
+
+test('publisher profiles retain editorial, undersized and covered-slot safeguards', async () => {
+  await withProfilePage('https://www.finanznachrichten.de/', '<div id="dmr1" style="width:300px;height:600px"><h2>Editorial content</h2></div>', async page => {
+    assert.equal((await detectAdSlots(page,300,250,'desktop',{returnCandidates:true})).bestSlot,null);
+  });
+  await withProfilePage('https://www.finanznachrichten.de/', '<div id="dmr1" style="width:300px;height:203px"></div>', async page => {
+    assert.equal((await detectAdSlots(page,300,250,'desktop',{returnCandidates:true})).bestSlot,null);
+  });
+  await withProfilePage('https://www.finanznachrichten.de/', '<div id="dmr1" style="width:300px;height:600px"></div><div style="position:fixed;inset:0;background:blue;z-index:1000"></div>', async page => {
+    const detected=await detectAdSlots(page,300,250,'desktop',{returnCandidates:true});
+    const result=await injectCreativeIntoDetectedSlot(page,detected.bestSlot,{adImageBuffer:await creative(),slotCandidates:detected.candidates});
+    assert.equal(result.succeeded,false);assert.equal(await page.$('[data-adframe-injected]'),null);
+  });
+});
